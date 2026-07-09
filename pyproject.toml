@@ -1,0 +1,18 @@
+[project]
+name = "civitai-fetcher"
+version = "0.1.0"
+description = "Fetch recent images + generation metadata for popular Civitai models"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+]
+
+[project.scripts]
+civitai-fetcher = "civitai_fetcher.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["civitai_fetcher*"]

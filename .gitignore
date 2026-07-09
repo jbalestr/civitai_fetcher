@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+civitai_output.json
+civitai_output_issues.json
+
+civitai_fetcher.egg-info/
