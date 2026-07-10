@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Fetch recent images + generation metadata for popular Civitai models"
 requires-python = ">=3.10"
 dependencies = [
+    "matplotlib>=3.10.9",
+    "pandas>=2.3.3",
     "requests>=2.31",
 ]
 
