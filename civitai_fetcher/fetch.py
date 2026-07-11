@@ -1,5 +1,8 @@
 import os
+import sys
 import argparse
+import random
+import time
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
@@ -7,23 +10,36 @@ import requests
 BASE = "https://civitai.com/api/v1"
 MAX_WORKERS = 10
 
+def _backoff_sleep(attempt, cap=30):
+    """Exponential backoff with jitter, capped — avoids many threads all
+    retrying in lockstep after a shared 429/503 (thundering herd)."""
+    jitter = random.uniform(0.5, 1.5)
+    time.sleep(min((2 ** attempt) * jitter, cap))
+
 def _get_with_retry(url, params, retries=3):
     """
     Helper function to execute requests with minimal retry logic.
+    Progress markers for long probe runs:
+      '.' — succeeded on the first try
+      'o' — succeeded, but only after at least one retry (429 or transient error)
+      'X' — exhausted all retries, gave up
+    'o' appearing is the early signal you're brushing up against the rate
+    limit even though nothing is failing outright yet.
     """
     for i in range(retries):
         try:
             r = requests.get(url, params=params, timeout=15)
             if r.status_code == 200:
+                print("." if i == 0 else "o", end="", flush=True)
                 return r
             if r.status_code == 429:
-                import time
-                time.sleep(2 ** i)
+                _backoff_sleep(i)
         except requests.exceptions.RequestException:
             if i == retries - 1:
+                print("X", end="", flush=True)
                 raise
-            import time
-            time.sleep(2 ** i)
+            _backoff_sleep(i)
+    print("X", end="", flush=True)
     raise requests.exceptions.RequestException(f"Failed to fetch from {url} after {retries} retries.")
 
 def probe_model_activity(model, since, page_limit, nsfw, rank, deep_probe_limit):
@@ -41,10 +57,12 @@ def probe_model_activity(model, since, page_limit, nsfw, rank, deep_probe_limit)
         "download_rank": rank,
         "page1_count": 0,
         "total_probe_count": 0,
-        "has_more_pages": False
+        "has_more_pages": False,
+        "probe_status": "ok"
     }
     
     if not model_id:
+        result["probe_status"] = "no_model_id"
         return result
         
     img_url = f"{BASE}/images"
@@ -102,6 +120,7 @@ def probe_model_activity(model, since, page_limit, nsfw, rank, deep_probe_limit)
                     result["has_more_pages"] = False
                     
     except Exception as e:
+        result["probe_status"] = "error"
         print(f"Error probing model {model_id} ({model_name}): {e}")
         
     return result
@@ -185,4 +204,115 @@ def probe_candidates(candidate_count=100, since_days=30, period="Month", max_wor
         }
         for future in as_completed(futures):
             results.append(future.result())
-    return results
+    return results, models, since
+
+
+def probe_recent_velocity(model, page_limit, nsfw, rank, window_days=3, max_pages=200):
+    """
+    Tier 3b: measures sustained post velocity over a fixed recent window
+    (window_days), bucketed by calendar day — instead of a raw count up to
+    an arbitrary cap. A count-based cap can't tell "sustained ~40/day" apart
+    from "one viral 280-image day, then silence" if both land near the same
+    total. Bucketing by day and reporting max_single_day / burst_ratio
+    alongside the average makes that spike visible instead of averaging it
+    away. Window is time-bounded, not count-bounded, so a genuinely quiet
+    model finishes in one page while a genuinely busy one costs more calls —
+    max_pages is a hard safety cap either way.
+    """
+    model_id = model.get("id")
+    model_name = model.get("name", "Unknown")
+    window_since = (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat().replace("+00:00", "Z")
+
+    result = {
+        "modelId": model_id,
+        "modelName": model_name,
+        "download_rank": rank,
+        "window_days": window_days,
+        "window_total": 0,
+        "velocity_per_day": 0.0,
+        "max_single_day": 0,
+        "burst_ratio": 0.0,
+        "velocity_probe_status": "ok",
+    }
+    if not model_id:
+        result["velocity_probe_status"] = "no_model_id"
+        return result
+
+    img_url = f"{BASE}/images"
+    params = {"modelId": model_id, "limit": page_limit, "nsfw": nsfw, "sort": "Newest"}
+
+    day_counts = {}
+    cursor = None
+    try:
+        for _ in range(max_pages):
+            if cursor:
+                params["cursor"] = cursor
+            r = _get_with_retry(img_url, params)
+            payload = r.json()
+            images = payload.get("items", [])
+            if not images:
+                break
+
+            in_window = [img for img in images if img.get("createdAt", "") >= window_since]
+            for img in in_window:
+                day = img.get("createdAt", "")[:10]  # YYYY-MM-DD
+                day_counts[day] = day_counts.get(day, 0) + 1
+
+            # a page with fewer in-window items than requested means we
+            # walked past the window boundary — stop
+            if len(in_window) < len(images):
+                break
+
+            cursor = payload.get("metadata", {}).get("nextCursor")
+            if not cursor:
+                break
+        else:
+            result["velocity_probe_status"] = "max_pages_hit"
+    except Exception as e:
+        result["velocity_probe_status"] = "error"
+        print(f"Error probing velocity for model {model_id} ({model_name}): {e}")
+
+    window_total = sum(day_counts.values())
+    result["window_total"] = window_total
+    result["velocity_per_day"] = round(window_total / window_days, 2) if window_days else float(window_total)
+    if day_counts:
+        max_day = max(day_counts.values())
+        result["max_single_day"] = max_day
+        result["burst_ratio"] = round(max_day / result["velocity_per_day"], 2) if result["velocity_per_day"] else 0.0
+
+    return result
+
+
+def add_velocity(results, models, top_n, page_limit, nsfw, window_days=3, max_pages=200, max_workers=MAX_WORKERS):
+    """
+    Computes probe_recent_velocity for the top_n models (by total_probe_count)
+    and merges the velocity fields into each matching result. Everything
+    outside top_n is left alone — this is a top-of-the-list refinement, not a
+    full re-probe.
+    """
+    models_by_id = {m.get("id"): m for m in models}
+    ranked = sorted(results, key=lambda r: r["total_probe_count"], reverse=True)[:top_n]
+
+    print(f"Measuring {window_days}-day daily velocity for top {len(ranked)} model(s)...")
+
+    velocity_by_id = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(probe_recent_velocity, models_by_id[r["modelId"]], page_limit, nsfw,
+                        r["download_rank"], window_days, max_pages): r["modelId"]
+            for r in ranked
+            if r["modelId"] in models_by_id
+        }
+        for future in as_completed(futures):
+            res = future.result()
+            velocity_by_id[res["modelId"]] = res
+
+    merged = []
+    for r in results:
+        v = velocity_by_id.get(r["modelId"])
+        if v:
+            r = {**r, "window_days": v["window_days"], "window_total": v["window_total"],
+                 "velocity_per_day": v["velocity_per_day"], "max_single_day": v["max_single_day"],
+                 "burst_ratio": v["burst_ratio"], "velocity_probe_status": v["velocity_probe_status"]}
+        merged.append(r)
+    return merged

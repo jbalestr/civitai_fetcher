@@ -1,7 +1,7 @@
 import argparse
 import pandas as pd
 import matplotlib.pyplot as plt
-from civitai_fetcher.fetch import probe_candidates
+from civitai_fetcher.fetch import probe_candidates, add_velocity
 
 def clean_label(label_str):
     """
@@ -13,30 +13,54 @@ def clean_label(label_str):
 
 def main():
     parser = argparse.ArgumentParser(description="Probe candidate models for current activity.")
-    parser.add_argument("--candidate-count", type=int, default=100,
-                         help="Size of the download-ranked candidate pool to probe (default: 100)")
+    parser.add_argument("--candidate-count", type=int, default=1000,
+                         help="Size of the download-ranked candidate pool to probe (default: 1000)")
     parser.add_argument("--period", default="Month", choices=["Day", "Week", "Month", "Year", "AllTime"],
                          help="Timeframe window for download popularity ranking (default: Month)")
     parser.add_argument("--since-days", type=int, default=30,
                          help="Activity window to check images against (default: 30)")
-    parser.add_argument("--types", nargs="+", default=None,
-                         help="Restrict candidate pool to these Civitai model types, e.g. --types Checkpoint")
+    parser.add_argument("--types", nargs="+", default="Checkpoint",
+                         help="Restrict candidate pool to these Civitai model types, e.g. --types Checkpoint Lora")
     parser.add_argument("--max-lora-versions", type=int, default=None,
                          help="Skip LORA-type candidates with more than N versions")
-    parser.add_argument("--page-limit", type=int, default=50,
-                         help="How many images deep to check per model on the Tier 1 pass (default: 50)")
+    parser.add_argument("--page-limit", type=int, default=100,
+                         help="How many images deep to check per model on the Tier 1 pass (default: 100)")
     parser.add_argument("--deep-probe-limit", type=int, default=150,
                          help="Max items to check for green models across an adaptive Tier 2 page (default: 150)")
     parser.add_argument("--only-ids", nargs="+", type=int, default=None,
                          help="Probe exactly these model IDs instead of a fresh download-ranked pool.")
     parser.add_argument("--nsfw", default="X")
+    parser.add_argument("--velocity-top-n", type=int, default=150,
+                         help="Tier 3b: measure sustained daily post velocity (day-bucketed, not a raw count) "
+                              "for this many top models by total_probe_count (default: 150, 0 = off)")
+    parser.add_argument("--velocity-window-days", type=int, default=3,
+                         help="Window size in days for velocity measurement (default: 3)")
+    parser.add_argument("--velocity-max-pages", type=int, default=400,
+                         help="Hard safety cap on pages fetched per model during velocity measurement (default: 400)")
     args = parser.parse_args()
 
-    results = probe_candidates(candidate_count=args.candidate_count, since_days=args.since_days, period=args.period, 
+    results, models, since = probe_candidates(candidate_count=args.candidate_count, since_days=args.since_days, period=args.period,
                                 nsfw=args.nsfw, types=args.types, max_lora_versions=args.max_lora_versions,
                                 page_limit=args.page_limit, deep_probe_limit=args.deep_probe_limit,
                                 only_ids=args.only_ids)
-    
+
+    capped = sum(1 for r in results if r.get("has_more_pages"))
+    if capped:
+        print(f"\n⚠️  {capped} model(s) hit the Tier 2 --deep-probe-limit ({args.deep_probe_limit}) and are "
+              f"tied at that value in total_probe_count — their real ranking is unresolved.\n"
+              f"   Use --velocity-top-n (on by default) to resolve them by day-bucketed velocity instead of "
+              f"raising --deep-probe-limit — a bigger count cap does NOT reliably resolve this (see README).\n")
+
+    if args.velocity_top_n:
+        results = add_velocity(results, models, args.velocity_top_n, args.page_limit, args.nsfw,
+                                window_days=args.velocity_window_days, max_pages=args.velocity_max_pages)
+        maxed = sum(1 for r in results if r.get("velocity_probe_status") == "max_pages_hit")
+        if maxed:
+            print(f"\n⚠️  {maxed} model(s) hit --velocity-max-pages ({args.velocity_max_pages}) while measuring "
+                  f"velocity — their velocity_per_day is a lower bound, not exact. Raise --velocity-max-pages "
+                  f"if you need the precise number for these.\n")
+
+    print()  # newline after the run of '.'/'X'/'o' progress marks
     df = pd.DataFrame(results)
     
     if df.empty:
@@ -55,6 +79,14 @@ def main():
     activity_view = df.sort_values("total_probe_count", ascending=False)
     print(activity_view[["label", "type", "download_rank", "page1_count", "total_probe_count", "has_more_pages"]]
           .head(20).to_string(index=False))
+
+    if "velocity_per_day" in df.columns:
+        vel_view = df[df["velocity_per_day"].notna()].sort_values("velocity_per_day", ascending=False)
+        print(f"\nTop 20 by sustained {args.velocity_window_days}-day velocity "
+              f"(burst_ratio: peak single day vs the {args.velocity_window_days}-day average — "
+              f"high burst_ratio = spiky/viral, not sustained):")
+        print(vel_view[["label", "velocity_per_day", "max_single_day", "burst_ratio", "window_total"]]
+              .head(20).to_string(index=False))
 
     fig, ax = plt.subplots(figsize=(14, 7))
     plot_df = activity_view.reset_index(drop=True)
