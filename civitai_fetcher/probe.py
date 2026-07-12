@@ -1,7 +1,9 @@
 import argparse
 import json
+import re
 import pandas as pd
 import matplotlib.pyplot as plt
+from datetime import datetime
 from civitai_fetcher.fetch import probe_candidates, add_velocity, _log
 import time
 from civitai_fetcher.config import (
@@ -10,10 +12,21 @@ from civitai_fetcher.config import (
     PROBE_VELOCITY_TOP_N, PROBE_VELOCITY_WINDOW_DAYS, PROBE_VELOCITY_MAX_PAGES,
 )
 
+_NON_ASCII_RE = re.compile(r"[^\x00-\x7F]+")
+
 def clean_label(label_str):
     """
     Truncates exceptionally long names for clean chart presentation.
+
+    Also strips non-ASCII characters (CJK, Japanese, Korean, etc.) — matplotlib's
+    default font (DejaVu Sans) can't render most of these, and leaving them in
+    triggers a "Glyph missing" UserWarning per unique glyph, every run, for any
+    model whose name contains them. This only affects the PNG chart's x-axis
+    labels; the real model name is preserved untouched in the CSV and HTML report.
     """
+    label_str = _NON_ASCII_RE.sub("", label_str).strip()
+    if not label_str:
+        label_str = "(unnamed)"
     if len(label_str) > 25:
         return label_str[:22] + "..."
     return label_str
@@ -193,8 +206,17 @@ def main():
 
     df["label"] = df["modelName"] + " (" + df["modelId"].astype(str) + ")"
     df = df.sort_values("download_rank").reset_index(drop=True)
-    df.to_csv("probe_results.csv", index=False)
-    print(f"Wrote probe_results.csv ({len(df)} models, sorted by download_rank over the last {args.period})", flush=True)
+
+    # Tag output filenames with period + run date so different test runs
+    # (e.g. --period Day vs --period Month) don't overwrite each other.
+    # e.g. probe_results_day_12jul26.csv
+    suffix = f"_{args.period.lower()}_{datetime.now().strftime('%d%b%y').lower()}"
+    results_path = f"probe_results{suffix}.csv"
+    report_path = f"probe_report{suffix}.html"
+    dist_path = f"probe_distribution{suffix}.png"
+
+    df.to_csv(results_path, index=False)
+    print(f"Wrote {results_path} ({len(df)} models, sorted by download_rank over the last {args.period})", flush=True)
 
     corr = df["download_rank"].corr(df["total_probe_count"].rank())
     print(f"Spearman correlation (download_rank vs total_probe_count): {corr:.2f}", flush=True)
@@ -212,7 +234,7 @@ def main():
         print(vel_view[["label", "velocity_per_day", "max_single_day", "burst_ratio", "window_total"]]
               .head(20).to_string(index=False), flush=True)
 
-    write_html_report(df, args)
+    write_html_report(df, args, path=report_path)
 
     fig, ax = plt.subplots(figsize=(14, 7))
     plot_df = activity_view.reset_index(drop=True)
@@ -238,10 +260,10 @@ def main():
         print(f"  ({n} models — thinned x-axis labels to every {step}th for plot scannability)", flush=True)
         
     plt.tight_layout()
-    plt.savefig("probe_distribution.png", dpi=150)
+    plt.savefig(dist_path, dpi=150)
     plt.close()
-    print("Wrote probe_distribution.png (shows the overall green/red distribution shape only — "
-          "open probe_report.html to browse/sort/filter individual models)", flush=True)
+    print(f"Wrote {dist_path} (shows the overall green/red distribution shape only — "
+          f"open {report_path} to browse/sort/filter individual models)", flush=True)
 
 if __name__ == "__main__":
     main()
