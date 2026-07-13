@@ -120,6 +120,7 @@ def fetch_model_images(model, since, max_pages=20, nsfw="X", max_versions=None):
                 "modelName": model_name,
                 "modelVersionId": version_id,
                 "modelUrl": f"{SITE}/models/{model_id}",
+                "baseModel": version.get("baseModel"),
                 "imageId": img["id"],
                 "imageUrl": img["url"],
                 "posterUsername": img.get("username"),
