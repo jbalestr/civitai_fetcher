@@ -1,49 +1,27 @@
-import argparse
-import json
+"""
+DEPRECATED — this module is a placeholder, not the working CLI.
 
-from .config import OUT_PATH, ISSUES_PATH, FETCH_MODEL_COUNT, FETCH_SINCE_DAYS, FETCH_MAX_PAGES, FETCH_NSFW
-from .fetch import fetch_all
-from .validate import validate_results
-from .resolve import enrich_resources, load_cache, save_cache
+`civitai_fetcher.cli` used to import a `fetch_all` from fetch.py that was
+removed in commit 1df2185 without repointing this file — that's why it's
+been raising ImportError since. Rather than resurrect that exact name, the
+image-fetching pipeline now lives in `civitai_fetcher.images_cli`, built on
+top of the split client.py / activity.py / images.py modules (see each
+module's docstring for why they're separated).
+
+Use:
+    uv run python -m civitai_fetcher.images_cli
+"""
+import sys
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fetch recent images+metadata for popular Civitai models.")
-    parser.add_argument("--model-count", type=int, default=FETCH_MODEL_COUNT, help="Number of popular models to pull")
-    parser.add_argument("--since-days", type=int, default=FETCH_SINCE_DAYS, help="Only fetch images created in the last N days")
-    parser.add_argument("--max-pages", type=int, default=FETCH_MAX_PAGES, help="Max pages to walk back per model version before giving up")
-    parser.add_argument("--max-versions", type=int, default=None, help="Only query the newest N versions per model (default: all versions)")
-    parser.add_argument("--types", nargs="+", default=None, help="Restrict to these Civitai model types, e.g. --types Checkpoint LORA (default: all types, including TextualInversion embeddings)")
-    parser.add_argument("--max-lora-versions", type=int, default=None, help="Skip LORA-type models with more than N versions (drops style/concept bundle packs; checkpoints are exempt)")
-    parser.add_argument("--nsfw", default=FETCH_NSFW, help="Civitai nsfw param (None/Soft/Mature/X/true/false). Default 'X' avoids silent NSFW filtering — see civitai/civitai#1277")
-    parser.add_argument("--resolve-resources", action="store_true", help="Resolve civitaiResources modelVersionIds to names + creator usernames (extra API calls, cached per unique ID)")
-    args = parser.parse_args()
-
-    results = fetch_all(
-        model_count=args.model_count,
-        since_days=args.since_days,
-        max_pages=args.max_pages,
-        nsfw=args.nsfw,
-        max_versions=args.max_versions,
-        types=args.types,
-        max_lora_versions=args.max_lora_versions,
+    print(
+        "civitai_fetcher.cli is deprecated and no longer implemented.\n"
+        "Use: uv run python -m civitai_fetcher.images_cli\n"
+        "(run with --help to see all options)",
+        file=sys.stderr,
     )
-
-    if args.resolve_resources:
-        load_cache()
-        results = enrich_resources(results)
-        save_cache()
-
-    with open(OUT_PATH, "w") as f:
-        json.dump(results, f, indent=2)
-
-    issues = validate_results(results)
-    if issues:
-        with open(ISSUES_PATH, "w") as f:
-            json.dump(issues, f, indent=2)
-        print(f"Wrote issues to {ISSUES_PATH}")
-
-    print(f"Wrote {len(results)} images to {OUT_PATH}")
+    sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -42,6 +42,17 @@ FETCH_SINCE_DAYS = 1
 FETCH_MAX_PAGES = 20
 FETCH_NSFW = "X"
 
+# --- images_cli.py defaults (activity-ranked discovery -> image fetch -> reaction rank) ---
+# Week strikes the best signal-to-noise balance in practice: Day's candidate pool is
+# too thin (~15 models) to be representative, Month's (~350) buries the images you
+# actually want to see under a lot of low-signal noise before you get to them.
+IMAGES_PERIOD = "Week"
+IMAGES_SINCE_DAYS = 7
+IMAGES_TOP_MODELS = 20      # how many activity-ranked models (by velocity_per_day) to pull images for
+IMAGES_MAX_PAGES = FETCH_MAX_PAGES
+IMAGES_NSFW = FETCH_NSFW
+IMAGES_TOP_REACTIONS = 30   # how many top-reaction images to keep/print, 0 = keep all
+
 # --- phase-level safety valve ---
 # Two layers: MODEL_TIMEOUT_SECONDS bounds a single model (checked between pages,
 # so a model gives up on itself before eating the shared budget); PHASE_TIMEOUT_SECONDS

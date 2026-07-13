@@ -20,7 +20,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .config import BASE, RESOLVER_CACHE_PATH, MAX_WORKERS
-from .fetch import _get_with_retry
+from .client import _get_with_retry
 
 _version_cache = {}  # modelVersionId (str) -> {"modelId": int, "name": str}
 _model_cache = {}     # modelId (str) -> creator username

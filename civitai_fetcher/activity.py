@@ -1,117 +1,18 @@
-import os
-import sys
-import argparse
-import random
-import threading
+"""
+Model-level activity ranking (Tier 1/2 page-cap probe + Tier 3b day-bucketed
+velocity). This is the logic behind probe.py.
+
+Deliberately imports only from client.py, never from images.py. That's the
+isolation guarantee: nothing done for image-fetching can break this module,
+because this module doesn't know images.py exists.
+"""
 import time
 from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, ALL_COMPLETED
-import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from .config import (
-    BASE, MAX_WORKERS, HEADERS, REQUEST_TIMEOUT, MAX_RETRIES,
-    BACKOFF_CAP, BACKOFF_JITTER_MIN, BACKOFF_JITTER_MAX, MODELS_PAGE_SIZE, POOL_MAXSIZE,
-    PHASE_TIMEOUT_SECONDS, MODEL_TIMEOUT_SECONDS,
-)
+from .config import BASE, MAX_WORKERS, PHASE_TIMEOUT_SECONDS, MODEL_TIMEOUT_SECONDS, BACKOFF_CAP
+from .client import _get_with_retry, _log, get_stats, reset_stats, get_popular_models, _wait_with_heartbeat
 
-# Shared session with a pooled connection adapter — plain requests.get() opens a fresh
-# TCP+TLS connection every call. Logs showed ~1.3-1.4s average latency per request with
-# zero rate-limiting, which is consistent with connection setup cost, not throttling.
-# Reusing a pooled Session lets threads reuse warm connections to civitai.com.
-_session = requests.Session()
-_adapter = requests.adapters.HTTPAdapter(pool_connections=POOL_MAXSIZE, pool_maxsize=POOL_MAXSIZE)
-_session.mount("https://", _adapter)
-_session.mount("http://", _adapter)
-
-_START = time.monotonic()
-
-def _log(msg):
-    """Timestamped diagnostic line: wall clock + seconds since process start,
-    so you can line up 'slow phase' against 'what was running at that time'."""
-    elapsed = time.monotonic() - _START
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts} +{elapsed:7.2f}s] {msg}", flush=True)
-
-# --- request-level stats, updated from every worker thread ---
-_stats_lock = threading.Lock()
-_stats = {
-    "requests": 0,       # total HTTP calls attempted (incl. retries)
-    "ok": 0,             # 200s
-    "rate_limited": 0,   # 429s hit
-    "exceptions": 0,     # RequestException (timeout, connection, etc)
-    "gave_up": 0,        # exhausted all retries
-    "request_seconds": 0.0,   # time spent inside requests.get() itself
-    "backoff_seconds": 0.0,   # time spent sleeping for backoff (not network — self-imposed)
-    "response_bytes": 0,      # total bytes received across all successful responses
-}
-
-def get_stats():
-    with _stats_lock:
-        return dict(_stats)
-
-def reset_stats():
-    with _stats_lock:
-        for k in _stats:
-            _stats[k] = 0 if not isinstance(_stats[k], float) else 0.0
-
-def _backoff_sleep(attempt, retry_after=None, cap=BACKOFF_CAP):
-    """Sleep before a retry. Prefers the server's explicit Retry-After header
-    (Civitai's rate-limit responses include one) over our own guess — avoids
-    sleeping 10s when the limit actually resets in 1.5s, or the reverse."""
-    if retry_after:
-        try:
-            sleep_for = min(float(retry_after), cap)
-        except (TypeError, ValueError):
-            retry_after = None
-    if not retry_after:
-        jitter = random.uniform(BACKOFF_JITTER_MIN, BACKOFF_JITTER_MAX)
-        sleep_for = min((2 ** attempt) * jitter, cap)
-    with _stats_lock:
-        _stats["backoff_seconds"] += sleep_for
-    time.sleep(sleep_for)
-
-def _get_with_retry(url, params, retries=MAX_RETRIES):
-    """
-    Helper function to execute requests with minimal retry logic.
-    Progress markers for long probe runs:
-      '.' — succeeded on the first try
-      'o' — succeeded, but only after at least one retry (429 or transient error)
-      'X' — exhausted all retries, gave up
-    'o' appearing is the early signal you're brushing up against the rate
-    limit even though nothing is failing outright yet.
-    """
-    for i in range(retries):
-        with _stats_lock:
-            _stats["requests"] += 1
-        t0 = time.monotonic()
-        try:
-            r = _session.get(url, params=params, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-            with _stats_lock:
-                _stats["request_seconds"] += time.monotonic() - t0
-            if r.status_code == 200:
-                with _stats_lock:
-                    _stats["ok"] += 1
-                    _stats["response_bytes"] += len(r.content)
-                print("." if i == 0 else "o", end="", flush=True)
-                return r
-            if r.status_code == 429:
-                with _stats_lock:
-                    _stats["rate_limited"] += 1
-                _backoff_sleep(i, retry_after=r.headers.get("Retry-After"))
-        except requests.exceptions.RequestException:
-            with _stats_lock:
-                _stats["request_seconds"] += time.monotonic() - t0
-                _stats["exceptions"] += 1
-            if i == retries - 1:
-                with _stats_lock:
-                    _stats["gave_up"] += 1
-                print("X", end="", flush=True)
-                raise
-            _backoff_sleep(i)
-    with _stats_lock:
-        _stats["gave_up"] += 1
-    print("X", end="", flush=True)
-    raise requests.exceptions.RequestException(f"Failed to fetch from {url} after {retries} retries.")
 
 def probe_model_activity(model, since, page_limit, nsfw, rank, deep_probe_limit):
     """
@@ -139,12 +40,12 @@ def probe_model_activity(model, since, page_limit, nsfw, rank, deep_probe_limit)
         "has_more_pages": False,
         "probe_status": "ok"
     }
-    
+
     if not model_id:
         result["probe_status"] = "no_model_id"
         result["probe_seconds"] = round(time.monotonic() - t_start, 3)
         return result
-        
+
     img_url = f"{BASE}/images"
     params = {
         "modelId": model_id,
@@ -159,7 +60,7 @@ def probe_model_activity(model, since, page_limit, nsfw, rank, deep_probe_limit)
         response_bytes += len(r.content)
         payload = r.json()
         images = payload.get("items", [])
-        
+
         # Count items matching our timeframe condition. Images are sorted Newest-first
         # (sort="Newest"), so once one falls outside the window every remaining item on
         # this page is guaranteed to be older too — stop scanning immediately.
@@ -171,19 +72,19 @@ def probe_model_activity(model, since, page_limit, nsfw, rank, deep_probe_limit)
                 break
         result["page1_count"] = len(recent_images)
         result["total_probe_count"] = len(recent_images)
-        
+
         next_cursor = payload.get("metadata", {}).get("nextCursor")
-        
+
         # Tier 2 Adaptive Deep Scan if the first page was completely saturated
         if len(recent_images) == page_limit and next_cursor:
             result["has_more_pages"] = True
-            
+
             # If a strict cap is set and we've already hit it, stop right away
             if deep_probe_limit and result["total_probe_count"] >= deep_probe_limit:
                 result["response_bytes"] = response_bytes
                 result["probe_seconds"] = round(time.monotonic() - t_start, 3)
                 return result
-                
+
             cursor = next_cursor
             while cursor:
                 if time.monotonic() - t_start > MODEL_TIMEOUT_SECONDS:
@@ -194,11 +95,11 @@ def probe_model_activity(model, since, page_limit, nsfw, rank, deep_probe_limit)
                 response_bytes += len(r_deep.content)
                 deep_payload = r_deep.json()
                 deep_images = deep_payload.get("items", [])
-                
+
                 if not deep_images:
                     result["has_more_pages"] = False
                     break
-                    
+
                 deep_recent = []
                 for img in deep_images:
                     if img.get("createdAt", "") >= since:
@@ -206,115 +107,27 @@ def probe_model_activity(model, since, page_limit, nsfw, rank, deep_probe_limit)
                     else:
                         break
                 result["total_probe_count"] += len(deep_recent)
-                
+
                 # Check if we broke through the trend window boundary
                 if len(deep_recent) < len(deep_images):
                     result["has_more_pages"] = False
                     break
-                    
+
                 if deep_probe_limit and result["total_probe_count"] >= deep_probe_limit:
                     break
-                    
+
                 cursor = deep_payload.get("metadata", {}).get("nextCursor")
                 if not cursor:
                     result["has_more_pages"] = False
-                    
+
     except Exception as e:
         result["probe_status"] = "error"
         print(f"Error probing model {model_id} ({model_name}): {e}", flush=True)
-        
+
     result["response_bytes"] = response_bytes
     result["probe_seconds"] = round(time.monotonic() - t_start, 3)
     return result
 
-def get_popular_models(limit=10, sort="Most Downloaded", period="Month", types=None, max_lora_versions=None, only_ids=None):
-    """
-    period: Window to calculate popularity over: "Day", "Week", "Month", "Year", "AllTime"
-    only_ids: if given (list/set of model IDs), skips the popularity query entirely.
-    """
-    t0 = time.monotonic()
-    if only_ids:
-        _log(f"Discovery: fetching {len(only_ids)} explicit model ID(s) directly (max_workers={MAX_WORKERS})...")
-        items = []
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            futures = {pool.submit(_get_with_retry, f"{BASE}/models/{mid}", {}): mid for mid in only_ids}
-            for future in as_completed(futures):
-                try:
-                    items.append(future.result().json())
-                except Exception as e:
-                    mid = futures[future]
-                    print(f"Failed to fetch explicit model ID {mid}: {e}", flush=True)
-        _log(f"Discovery done: {len(items)} model(s) in {time.monotonic()-t0:.2f}s")
-        return items
-
-    _log(f"Discovery: paging /models (sort={sort}, period={period}) until {limit} candidates...")
-    items = []
-    seen_ids = set()
-    cursor = None
-    n_pages = 0
-    while len(items) < limit:
-        params = {
-            "limit": min(MODELS_PAGE_SIZE, limit - len(items)), 
-            "sort": sort,
-            "period": period
-        }
-        if types:
-            params["types"] = types
-        if cursor:
-            params["cursor"] = cursor
-            
-        r = _get_with_retry(f"{BASE}/models", params)
-        n_pages += 1
-        payload = r.json()
-        page_items = payload.get("items", [])
-        if not page_items:
-            break
-
-        new_items = [m for m in page_items if m.get("id") not in seen_ids]
-        if not new_items:
-            break
-        for m in new_items:
-            if m.get("id"):
-                seen_ids.add(m["id"])
-        items.extend(new_items)
-
-        next_cursor = payload.get("metadata", {}).get("nextCursor")
-        if not next_cursor:
-            break
-        cursor = next_cursor
-
-    if max_lora_versions is not None:
-        kept = []
-        for m in items:
-            if m.get("type") == "LORA" and len(m.get("modelVersions") or []) > max_lora_versions:
-                print(f"  Skipping {m.get('name')} ({m.get('id')}) — LORA with "
-                      f"{len(m.get('modelVersions') or [])} versions (style/concept pack, likely)", flush=True)
-                continue
-            kept.append(m)
-        items = kept
-
-    _log(f"Discovery done: {len(items)} model(s) over {n_pages} page(s) in {time.monotonic()-t0:.2f}s "
-         f"(this part is sequential/single-threaded — {n_pages} network round-trips, one after another)")
-    return items
-
-def _wait_with_heartbeat(futures, phase_timeout, label, heartbeat_interval=10):
-    """Like wait(..., timeout=phase_timeout, return_when=ALL_COMPLETED), but prints
-    a progress line every heartbeat_interval seconds instead of blocking silently —
-    so a long-but-legitimate wait doesn't look identical to a genuine hang."""
-    total = len(futures)
-    deadline = time.monotonic() + phase_timeout
-    done = set()
-    not_done = set(futures)
-    while not_done:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        slice_done, not_done = wait(not_done, timeout=min(heartbeat_interval, remaining), return_when=ALL_COMPLETED)
-        done |= slice_done
-        if not_done:
-            _log(f"  ...{label} still running: {len(done)}/{total} done, {len(not_done)} in flight "
-                 f"(phase timeout in {max(0, deadline - time.monotonic()):.0f}s)")
-    return done, not_done
 
 def probe_candidates(candidate_count=100, since_days=30, period="Month", max_workers=MAX_WORKERS, nsfw="X",
                      types=None, max_lora_versions=None, page_limit=50, deep_probe_limit=None, only_ids=None):
@@ -322,7 +135,7 @@ def probe_candidates(candidate_count=100, since_days=30, period="Month", max_wor
     Passes the period flag down to the model finder.
     """
     since = (datetime.now(timezone.utc) - timedelta(days=since_days)).isoformat().replace("+00:00", "Z")
-    models = get_popular_models(limit=candidate_count, period=period, types=types, 
+    models = get_popular_models(limit=candidate_count, period=period, types=types,
                                 max_lora_versions=max_lora_versions, only_ids=only_ids)
 
     _log(f"Tier 1/2 probe: {len(models)} model(s), max_workers={max_workers} "
@@ -440,13 +253,11 @@ def probe_recent_velocity(model, page_limit, nsfw, rank, window_days=3, max_page
             # Sorted Newest-first: the first image outside the window means every
             # remaining item on this page (and all subsequent pages) is older too.
             reached_end_of_window = False
-            in_window_count = 0
             for img in images:
                 created_at = img.get("createdAt", "")
                 if created_at >= window_since:
                     day = created_at[:10]  # YYYY-MM-DD
                     day_counts[day] = day_counts.get(day, 0) + 1
-                    in_window_count += 1
                 else:
                     reached_end_of_window = True
                     break

@@ -4,13 +4,23 @@ import re
 import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime
-from civitai_fetcher.fetch import probe_candidates, add_velocity, _log
+from civitai_fetcher.activity import probe_candidates, add_velocity
+from civitai_fetcher.client import _log
 import time
 from civitai_fetcher.config import (
     PROBE_CANDIDATE_COUNT, PROBE_PERIOD, PROBE_SINCE_DAYS, PROBE_TYPES,
     PROBE_PAGE_LIMIT, PROBE_DEEP_PROBE_LIMIT, PROBE_NSFW,
     PROBE_VELOCITY_TOP_N, PROBE_VELOCITY_WINDOW_DAYS, PROBE_VELOCITY_MAX_PAGES,
 )
+
+# When --since-days / --velocity-window-days aren't explicitly passed, derive them
+# from --period so the windows stay internally consistent (e.g. --period Day no
+# longer silently measures a 3-day velocity window against a 1-day activity count).
+# Year/AllTime deliberately aren't in here: blindly extending since-days to 365
+# would make every model probe walk back a full year of pages, a much more
+# expensive run than picking --period Year implies on its own — safer to keep
+# the existing tuned defaults for those unless you explicitly override them.
+PERIOD_TO_DAYS = {"Day": 1, "Week": 7, "Month": 30}
 
 _NON_ASCII_RE = re.compile(r"[^\x00-\x7F]+")
 
@@ -148,8 +158,9 @@ def main():
                          help=f"Size of the download-ranked candidate pool to probe (default: {PROBE_CANDIDATE_COUNT})")
     parser.add_argument("--period", default=PROBE_PERIOD, choices=["Day", "Week", "Month", "Year", "AllTime"],
                          help=f"Timeframe window for download popularity ranking (default: {PROBE_PERIOD})")
-    parser.add_argument("--since-days", type=int, default=PROBE_SINCE_DAYS,
-                         help=f"Activity window to check images against (default: {PROBE_SINCE_DAYS})")
+    parser.add_argument("--since-days", type=int, default=None,
+                         help=f"Activity window to check images against (default: derived from --period — "
+                              f"1/7/30 for Day/Week/Month, else {PROBE_SINCE_DAYS})")
     parser.add_argument("--types", nargs="+", default=PROBE_TYPES,
                          help="Restrict candidate pool to these Civitai model types, e.g. --types Checkpoint Lora")
     parser.add_argument("--max-lora-versions", type=int, default=None,
@@ -164,15 +175,26 @@ def main():
     parser.add_argument("--velocity-top-n", type=int, default=PROBE_VELOCITY_TOP_N,
                          help=f"Tier 3b: measure sustained daily post velocity (day-bucketed, not a raw count) "
                               f"for this many top models by total_probe_count (default: {PROBE_VELOCITY_TOP_N}, 0 = off)")
-    parser.add_argument("--velocity-window-days", type=int, default=PROBE_VELOCITY_WINDOW_DAYS,
-                         help=f"Window size in days for velocity measurement (default: {PROBE_VELOCITY_WINDOW_DAYS})")
+    parser.add_argument("--velocity-window-days", type=int, default=None,
+                         help=f"Window size in days for velocity measurement (default: derived from --period — "
+                              f"1/7/30 for Day/Week/Month, else {PROBE_VELOCITY_WINDOW_DAYS})")
     parser.add_argument("--velocity-max-pages", type=int, default=PROBE_VELOCITY_MAX_PAGES,
                          help=f"Hard safety cap on pages fetched per model during velocity measurement (default: {PROBE_VELOCITY_MAX_PAGES})")
     args = parser.parse_args()
 
+    # Auto-derive since-days / velocity-window-days from --period unless the
+    # user explicitly passed one — keeps them internally consistent by default
+    # (e.g. --period Day no longer silently pairs with a 3-day velocity window).
+    derived_days = PERIOD_TO_DAYS.get(args.period)
+    if args.since_days is None:
+        args.since_days = derived_days if derived_days is not None else PROBE_SINCE_DAYS
+    if args.velocity_window_days is None:
+        args.velocity_window_days = derived_days if derived_days is not None else PROBE_VELOCITY_WINDOW_DAYS
+
     run_t0 = time.monotonic()
-    _log(f"Run start — candidate_count={args.candidate_count}, page_limit={args.page_limit}, "
-         f"deep_probe_limit={args.deep_probe_limit}, velocity_top_n={args.velocity_top_n}")
+    _log(f"Run start — candidate_count={args.candidate_count}, period={args.period}, since_days={args.since_days}, "
+         f"page_limit={args.page_limit}, deep_probe_limit={args.deep_probe_limit}, "
+         f"velocity_top_n={args.velocity_top_n}, velocity_window_days={args.velocity_window_days}")
 
     results, models, since = probe_candidates(candidate_count=args.candidate_count, since_days=args.since_days, period=args.period,
                                 nsfw=args.nsfw, types=args.types, max_lora_versions=args.max_lora_versions,
