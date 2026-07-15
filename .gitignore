@@ -10,3 +10,5 @@ civitai_fetcher.egg-info/
 *_cache.json
 "@ | Out-File -Encoding utf8 -FilePath .gitignore
 *.html
+
+output/
