@@ -38,53 +38,68 @@ from .validate import validate_results
 from .resolve import enrich_resources, load_cache, save_cache
 
 
+
+# Per-period filter thresholds.
+# velocity_per_day is already normalised so the same floor applies across periods.
+# probe threshold scales with "consistently active across the period":
+#   Day   >= 5   (active today)
+#   Week  >= 30  (active most of the week)
+#   Month >= 100 (3+ solid weeks)
+PERIOD_FILTERS = {
+    "Day":   {"min_velocity": 5, "min_probe": 5},
+    "Week":  {"min_velocity": 5, "min_probe": 30},
+    "Month": {"min_velocity": 5, "min_probe": 100},
+}
+
+# velocity window by period — Day uses 1 day, everything else 3 days
+PERIOD_VELOCITY_WINDOW = {
+    "Day": 1,
+    "Week": 3,
+    "Month": 3,
+}
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Find currently-active popular Civitai models, then fetch their images ranked by reactions."
     )
-    parser.add_argument("--period", default=IMAGES_PERIOD, choices=["Day", "Week", "Month", "Year", "AllTime"],
-                        help=f"Window to rank model popularity/activity over (default: {IMAGES_PERIOD} — "
-                             f"best signal-to-noise in practice, see README)")
-    parser.add_argument("--since-days", type=int, default=IMAGES_SINCE_DAYS,
-                        help="Image activity/fetch window in days (default matches --period)")
-    parser.add_argument("--candidate-count", type=int, default=PROBE_CANDIDATE_COUNT,
-                        help="How many models to discover by download rank before activity-ranking them")
-    parser.add_argument("--top-models", type=int, default=IMAGES_TOP_MODELS,
-                        help="How many activity-ranked models to actually fetch images for")
-    parser.add_argument("--types", nargs="+", default=[PROBE_TYPES],
-                        help="Restrict to these Civitai model types, e.g. --types Checkpoint LORA")
-    parser.add_argument("--max-lora-versions", type=int, default=None,
-                        help="Skip LORA-type models with more than N versions (style/concept bundle packs)")
-    parser.add_argument("--page-limit", type=int, default=PROBE_PAGE_LIMIT, help="Tier 1/2 activity-probe page depth")
-    parser.add_argument("--deep-probe-limit", type=int, default=PROBE_DEEP_PROBE_LIMIT,
-                        help="Tier 2 adaptive cap for the activity probe")
-    parser.add_argument("--velocity-window-days", type=int, default=PROBE_VELOCITY_WINDOW_DAYS,
-                        help="Tier 3b sustained-velocity window, used to break ties at --deep-probe-limit")
-    parser.add_argument("--velocity-max-pages", type=int, default=PROBE_VELOCITY_MAX_PAGES,
-                        help="Tier 3b safety cap on pages walked per model")
-    parser.add_argument("--max-pages", type=int, default=IMAGES_MAX_PAGES,
-                        help="Max pages to walk back per model VERSION during image fetch")
-    parser.add_argument("--max-versions", type=int, default=None,
-                        help="Only fetch images from the newest N versions per model (default: all versions)")
-    parser.add_argument("--nsfw", default=IMAGES_NSFW,
-                        help="Civitai nsfw param (None/Soft/Mature/X/true/false). Default 'X' avoids silent NSFW filtering")
+    parser.add_argument("--period", default=IMAGES_PERIOD, choices=["Day", "Week", "Month"],
+                        help=f"Window to rank model popularity/activity over (default: {IMAGES_PERIOD})")
+    parser.add_argument("--top-reactions-per-model", type=int, default=50,
+                        help="Keep the top N images PER MODEL ranked by community reactions (default: 50). "
+                             "Every active model contributes equally regardless of overall popularity — "
+                             "prevents one dominant checkpoint crowding out the rest. "
+                             "Set to 0 to switch to global ranking via --top-reactions instead.")
     parser.add_argument("--top-reactions", type=int, default=IMAGES_TOP_REACTIONS,
-                        help="How many top-reaction images to keep GLOBALLY (0 = keep all fetched). "
-                             "Ignored if --top-reactions-per-model is set.")
-    parser.add_argument("--top-reactions-per-model", type=int, default=None,
-                        help="Instead of one global top-N, keep the top N images PER MODEL — guarantees "
-                             "every fetched model is represented, useful for comparing models/checkpoint "
-                             "types rather than letting one high-reaction model crowd out the rest. "
-                             "Overrides --top-reactions when set.")
-    parser.add_argument("--top-resources", type=int, default=15,
-                        help="How many entries to print in the LoRA/combo usage breakdowns (0 = skip this section)")
-    parser.add_argument("--resolve-resources", dest="resolve_resources", action="store_true", default=True,
-                        help="Resolve civitaiResources modelVersionIds to names + creator usernames (default: on — "
-                             "you'll almost always want readable names, not raw IDs)")
-    parser.add_argument("--no-resolve-resources", dest="resolve_resources", action="store_false",
-                        help="Skip resource-name resolution — faster, but LoRA/checkpoint names in the usage "
-                             "breakdowns and civitaiResources fields stay as raw modelVersionIds")
+                        help="Keep the top N images GLOBALLY across all models (default: 30). "
+                             "Only used when --top-reactions-per-model is 0. "
+                             "Warning: a single high-reaction model can dominate the output.")
+
+    # --- internal / advanced flags (hidden from --help) ---
+    SUPPRESS = argparse.SUPPRESS
+    parser.add_argument("--since-days", type=int, default=IMAGES_SINCE_DAYS, help=SUPPRESS)
+    parser.add_argument("--candidate-count", type=int, default=PROBE_CANDIDATE_COUNT, help=SUPPRESS)
+    parser.add_argument("--types", nargs="+", default=[PROBE_TYPES], help=SUPPRESS)
+    parser.add_argument("--max-lora-versions", type=int, default=None, help=SUPPRESS)
+    parser.add_argument("--page-limit", type=int, default=PROBE_PAGE_LIMIT, help=SUPPRESS)
+    parser.add_argument("--deep-probe-limit", type=int, default=PROBE_DEEP_PROBE_LIMIT, help=SUPPRESS)
+    parser.add_argument("--velocity-max-pages", type=int, default=PROBE_VELOCITY_MAX_PAGES, help=SUPPRESS)
+    parser.add_argument("--max-pages", type=int, default=IMAGES_MAX_PAGES, help=SUPPRESS)
+    parser.add_argument("--max-versions", type=int, default=None, help=SUPPRESS)
+    parser.add_argument("--nsfw", default=IMAGES_NSFW, help=SUPPRESS)
+    parser.add_argument("--top-resources", type=int, default=15, help=SUPPRESS)
+    parser.add_argument("--resolve-resources", dest="resolve_resources", action="store_true", default=True, help=SUPPRESS)
+    parser.add_argument("--no-resolve-resources", dest="resolve_resources", action="store_false", help=SUPPRESS)
+    # override filters (escape hatch — normally derived from --period)
+    parser.add_argument("--min-velocity", type=float, default=None, help=SUPPRESS)
+    parser.add_argument("--min-probe", type=int, default=None, help=SUPPRESS)
     args = parser.parse_args()
+
+    # Derive per-period defaults
+    thresholds = PERIOD_FILTERS.get(args.period, PERIOD_FILTERS["Week"])
+    min_velocity = args.min_velocity if args.min_velocity is not None else thresholds["min_velocity"]
+    min_probe = args.min_probe if args.min_probe is not None else thresholds["min_probe"]
+    velocity_window_days = PERIOD_VELOCITY_WINDOW.get(args.period, 3)
 
     # Step 1: rank models by download popularity, then activity (Tier 1/2 + Tier 3b).
     results, models, since = probe_candidates(
@@ -92,20 +107,25 @@ def main():
         nsfw=args.nsfw, types=args.types, max_lora_versions=args.max_lora_versions,
         page_limit=args.page_limit, deep_probe_limit=args.deep_probe_limit,
     )
-    if args.velocity_window_days:
-        results = add_velocity(
-            results, models, top_n=min(args.top_models * 3, len(results)),
-            page_limit=args.page_limit, nsfw=args.nsfw,
-            window_days=args.velocity_window_days, max_pages=args.velocity_max_pages,
-        )
-        results = sorted(results, key=lambda r: r.get("velocity_per_day", 0), reverse=True)
-    else:
-        results = sorted(results, key=lambda r: r.get("total_probe_count", 0), reverse=True)
+    results = add_velocity(
+        results, models, top_n=len(results),
+        page_limit=args.page_limit, nsfw=args.nsfw,
+        window_days=velocity_window_days, max_pages=args.velocity_max_pages,
+    )
+    results = sorted(results, key=lambda r: r.get("velocity_per_day", 0), reverse=True)
 
-    top_results = results[:args.top_models]
+    # Filter to consistently active models only
+    before = len(results)
+    results = [r for r in results
+               if r.get("velocity_per_day", 0) >= min_velocity
+               and r.get("total_probe_count", 0) >= min_probe]
+    print(f"Activity filter (velocity >= {min_velocity}/day, probe >= {min_probe}): "
+          f"{len(results)} of {before} models kept")
+
+    top_results = results
     top_ids = {r["modelId"] for r in top_results}
     top_models_full = [m for m in models if m.get("id") in top_ids]
-    print(f"\nTop {len(top_models_full)} model(s) by current activity — fetching their images now:")
+    print(f"\n{len(top_models_full)} model(s) by current activity — fetching their images now:")
     for r in top_results:
         print(f"  {r['modelName'][:50]:50s} velocity/day={r.get('velocity_per_day', '?'):>8}  "
               f"total_probe_count={r.get('total_probe_count')}")
@@ -157,6 +177,7 @@ def main():
     out_path = OUT_PATH.replace(".json", f"{suffix}.json")
     issues_path = ISSUES_PATH.replace(".json", f"{suffix}.json")
 
+    import pathlib; pathlib.Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
         json.dump(ranked, f, indent=2)
 

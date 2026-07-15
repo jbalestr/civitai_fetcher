@@ -129,7 +129,7 @@ def fetch_model_images(model, since, max_pages=20, nsfw="X", max_versions=None):
                 "width": img.get("width"),
                 "height": img.get("height"),
                 "createdAt": img.get("createdAt"),
-                "nsfwLevel": img.get("nsfwLevel"),
+                "nsfwLevel": img.get("nsfwLevel") if img.get("nsfwLevel") != "None" else None,
                 "stats": img.get("stats"),
                 "reactionScore": reaction_score(img.get("stats")),
                 # --- dynamic generation metadata last ---
