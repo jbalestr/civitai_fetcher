@@ -162,7 +162,20 @@ def main():
             print(f"  {checkpoint[:35]:35s} {wl:>7}({100*wl/total:4.0f}%) {br:>5}({100*br/total:3.0f}%) "
                   f"{nr:>5}({100*nr/total:3.0f}%)   {total}")
 
-    # Step 3: rank by reactions, client-side (see images.py docstring for why).
+    # Step 3: dedup by imageId (same image can appear under multiple model
+    # versions if a post is shared — keep first occurrence which has the
+    # highest reaction score after sorting).
+    seen_image_ids: set[int] = set()
+    deduped = []
+    for e in entries:
+        if e["imageId"] not in seen_image_ids:
+            deduped.append(e)
+            seen_image_ids.add(e["imageId"])
+    if len(deduped) < len(entries):
+        print(f"Deduped {len(entries) - len(deduped)} duplicate imageId(s)")
+    entries = deduped
+
+    # Step 4: rank by reactions, client-side (see images.py docstring for why).
     if args.top_reactions_per_model:
         ranked = sort_by_reactions_per_model(entries, top_n_per_model=args.top_reactions_per_model)
     else:
