@@ -148,10 +148,22 @@ def _get_with_retry(url, params, retries=MAX_RETRIES):
     print("X", end="", flush=True)
     raise requests.exceptions.RequestException(f"Failed to fetch from {url} after {retries} retries.")
 
-def get_popular_models(limit=10, sort="Most Downloaded", period="Month", types=None, max_lora_versions=None, only_ids=None):
+def get_popular_models(limit=10, sort="Most Downloaded", period="Month", types=None, max_lora_versions=None,
+                        only_ids=None, username=None):
     """
     period: Window to calculate popularity over: "Day", "Week", "Month", "Year", "AllTime"
     only_ids: if given (list/set of model IDs), skips the popularity query entirely.
+    username: if given, restricts to models by this creator (Civitai's own /models filter —
+        this is the creator's profile name, e.g. "WAI0731", NOT a numeric user ID; the API
+        has no numeric-userId filter for /models, only username). Combines with sort/period
+        as normal — e.g. sort="Newest" to just list everything they've published.
+    types: filtered CLIENT-SIDE after fetching, not sent to the API as a `types` query param.
+        Civitai's own server-side filters have a documented habit of quietly interacting
+        badly with other params/sort combinations (e.g. civitai/civitai#1848, #2134) — the
+        /models response is cheap JSON either way, so it's fetched unfiltered up to `limit`
+        and filtered locally instead, same principle used for image media-type filtering.
+        Note this means the final returned count can be lower than `limit` once non-matching
+        types are dropped.
     """
     t0 = time.monotonic()
     if only_ids:
@@ -168,7 +180,8 @@ def get_popular_models(limit=10, sort="Most Downloaded", period="Month", types=N
         _log(f"Discovery done: {len(items)} model(s) in {time.monotonic()-t0:.2f}s")
         return items
 
-    _log(f"Discovery: paging /models (sort={sort}, period={period}) until {limit} candidates...")
+    _log(f"Discovery: paging /models (sort={sort}, period={period}"
+         f"{f', username={username}' if username else ''}) until {limit} candidates...")
     items = []
     seen_ids = set()
     cursor = None
@@ -179,8 +192,8 @@ def get_popular_models(limit=10, sort="Most Downloaded", period="Month", types=N
             "sort": sort,
             "period": period
         }
-        if types:
-            params["types"] = types
+        if username:
+            params["username"] = username
         if cursor:
             params["cursor"] = cursor
 
@@ -203,6 +216,13 @@ def get_popular_models(limit=10, sort="Most Downloaded", period="Month", types=N
         if not next_cursor:
             break
         cursor = next_cursor
+
+    if types:
+        wanted = {t.lower() for t in types}
+        before = len(items)
+        items = [m for m in items if (m.get("type") or "").lower() in wanted]
+        if len(items) < before:
+            print(f"  Filtered to types={types}: {len(items)}/{before} model(s) kept", flush=True)
 
     if max_lora_versions is not None:
         kept = []

@@ -19,6 +19,7 @@ way sort=Newest does — so rather than trust that combination, we fetch the
 full window newest-first (same as the old code) and rank reactions ourselves.
 """
 import time
+import threading
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,7 +28,9 @@ from .config import BASE, SITE, MAX_WORKERS
 from .client import _get_with_retry, _log, get_stats, reset_stats, get_popular_models, _wait_all_with_heartbeat
 
 
-def get_recent_images_with_meta(model_version_id, since, page_limit=100, max_pages=20, nsfw="X"):
+def get_recent_images_with_meta(model_version_id, since, page_limit=100, max_pages=20, nsfw="X",
+                                 require_meta=True, stop_event=None, counter=None, counter_lock=None,
+                                 limit_total=None):
     """
     Cursor-paginate through a single model VERSION's images (newest first),
     keeping only images with createdAt >= `since`. Stops as soon as a page's
@@ -42,6 +45,25 @@ def get_recent_images_with_meta(model_version_id, since, page_limit=100, max_pag
     excludes NSFW items regardless of your actual access level (documented API
     quirk, civitai/civitai#1277). "X" is the highest content tier and reliably
     returns the full range, not just X-rated images specifically.
+
+    No `type`/media-type filter is sent here deliberately — Civitai's own
+    server-side filters have a documented habit of silently no-op'ing once
+    combined with other params (e.g. civitai/civitai#1848, #2134). The JSON
+    fetch is cheap either way, so media-type filtering is applied client-side
+    afterwards instead (see fetch_model_images) — same principle as the
+    createdAt window filter below, which was already client-side.
+
+    require_meta=True (default): sends withMeta=true, matching this tool's
+    original purpose (generation metadata). Some creators strip/hide their
+    prompts entirely (e.g. custom pipelines, or deliberately private), and
+    Civitai's API then returns a nextCursor forever with zero items on every
+    page rather than a clean "no results" — set require_meta=False to skip
+    withMeta and fetch bare image/video records (no meta) for those cases.
+
+    stop_event/counter/counter_lock/limit_total: an optional shared early-stop
+    mechanism across models running in parallel (see fetch_images_for_models).
+    Checked between pages (not mid-page) — once the shared counter reaches
+    limit_total, every model's pagination winds down on its next loop.
     """
     collected = []
     cursor = None
@@ -49,12 +71,16 @@ def get_recent_images_with_meta(model_version_id, since, page_limit=100, max_pag
     hit_page_cap = False
 
     while True:
+        if stop_event is not None and stop_event.is_set():
+            break
+
         params = {
             "modelVersionId": model_version_id,
             "sort": "Newest",
             "limit": page_limit,
-            "withMeta": "true",
         }
+        if require_meta:
+            params["withMeta"] = "true"
         if nsfw:
             params["nsfw"] = nsfw
         if cursor:
@@ -67,24 +93,41 @@ def get_recent_images_with_meta(model_version_id, since, page_limit=100, max_pag
         in_window = [img for img in items if img.get("createdAt", "") >= since]
         collected.extend(in_window)
 
+        if counter is not None and in_window:
+            with counter_lock:
+                counter["n"] += len(in_window)
+                if limit_total and counter["n"] >= limit_total and stop_event is not None:
+                    stop_event.set()
+
         pages_fetched += 1
         next_cursor = payload.get("metadata", {}).get("nextCursor")
         past_window = bool(items) and not in_window  # page had items, none survived the filter
         no_more_pages = not next_cursor
         hit_page_cap = pages_fetched >= max_pages
+        limit_hit = bool(stop_event is not None and stop_event.is_set())
 
-        if past_window or no_more_pages or hit_page_cap:
+        if past_window or no_more_pages or hit_page_cap or limit_hit:
             break
         cursor = next_cursor
 
     return collected, hit_page_cap
 
 
-def fetch_model_images(model, since, max_pages=20, nsfw="X", max_versions=None):
+def fetch_model_images(model, since, max_pages=20, nsfw="X", max_versions=None, media_type=None,
+                        require_meta=True, stop_event=None, counter=None, counter_lock=None, limit_total=None):
     """
-    Fetch all meta'd images created since `since` (ISO timestamp) across a
-    model's versions. If max_versions is set, only the newest N versions are
-    queried (skips ancient/inactive versions that otherwise pad results).
+    Fetch all images created since `since` (ISO timestamp) across a model's
+    versions. If max_versions is set, only the newest N versions are queried
+    (skips ancient/inactive versions that otherwise pad results).
+
+    media_type: "image" | "video" | "audio" — filtered CLIENT-SIDE against
+    each item's own "type" field after fetching (not sent to the API — see
+    get_recent_images_with_meta for why).
+    require_meta=True (default): only keep images that have generation
+    metadata attached (this tool's original purpose). Set False to also
+    keep bare images/videos with no meta (e.g. creators who strip prompts).
+    stop_event/counter/counter_lock/limit_total: shared early-stop across
+    models/versions — see fetch_images_for_models.
     """
     model_id = model["id"]
     model_name = model["name"]
@@ -96,12 +139,15 @@ def fetch_model_images(model, since, max_pages=20, nsfw="X", max_versions=None):
     any_version_hit_cap = False
 
     for version in versions:
+        if stop_event is not None and stop_event.is_set():
+            break
         version_id = version.get("id")
         if not version_id:
             continue
         try:
             images, hit_cap = get_recent_images_with_meta(
-                version_id, since=since, max_pages=max_pages, nsfw=nsfw
+                version_id, since=since, max_pages=max_pages, nsfw=nsfw, require_meta=require_meta,
+                stop_event=stop_event, counter=counter, counter_lock=counter_lock, limit_total=limit_total,
             )
         except Exception as e:
             print(f"  {model_name} ({model_id}) version {version_id} skipped, error: {e}", flush=True)
@@ -111,8 +157,9 @@ def fetch_model_images(model, since, max_pages=20, nsfw="X", max_versions=None):
             any_version_hit_cap = True
 
         for img in images:
-            # defensive check, withMeta should already exclude these server-side
-            if not img.get("meta"):
+            if require_meta and not img.get("meta"):
+                continue
+            if media_type and img.get("type") != media_type:
                 continue
             entries.append({
                 # --- static / simple fields first ---
@@ -130,6 +177,7 @@ def fetch_model_images(model, since, max_pages=20, nsfw="X", max_versions=None):
                 "height": img.get("height"),
                 "createdAt": img.get("createdAt"),
                 "nsfwLevel": img.get("nsfwLevel") if img.get("nsfwLevel") != "None" else None,
+                "mediaType": img.get("type"),
                 "stats": img.get("stats"),
                 "reactionScore": reaction_score(img.get("stats")),
                 # --- dynamic generation metadata last ---
@@ -138,25 +186,46 @@ def fetch_model_images(model, since, max_pages=20, nsfw="X", max_versions=None):
 
     cap_note = " [hit max_pages cap on at least one version — window may be incomplete, consider raising max_pages]" \
         if any_version_hit_cap else ""
-    print(f"  {model_name} ({model_id}): {len(entries)} images with meta since {since}{cap_note}", flush=True)
+    meta_note = "images with meta" if require_meta else "images (meta not required)"
+    print(f"  {model_name} ({model_id}): {len(entries)} {meta_note} since {since}{cap_note}", flush=True)
     return entries
 
 
-def fetch_images_for_models(models, since, max_workers=MAX_WORKERS, max_pages=20, nsfw="X", max_versions=None):
+def fetch_images_for_models(models, since, max_workers=MAX_WORKERS, max_pages=20, nsfw="X", max_versions=None,
+                             media_type=None, require_meta=True, limit_total=None):
     """
     Fetch images for an already-discovered/ranked list of model dicts —
     e.g. the Week-ranked output of activity.probe_candidates(). This is the
     primitive to use when you want images for activity-ranked models rather
     than plain download-ranked ones; it does zero discovery of its own.
+
+    media_type: "image" | "video" | "audio" — restricts to that media type,
+    filtered client-side after fetching.
+    require_meta=True (default): only keep images with generation metadata.
+    Set False for creators who strip/hide their prompts (see
+    get_recent_images_with_meta for the Civitai API quirk this works around).
+
+    limit_total: if set, stops fetching (across all models/workers, via a
+    shared threading.Event) once roughly this many in-window images have
+    been collected. It's a soft cap, checked between pages rather than
+    mid-page, so the actual result count may overshoot slightly — trim to
+    an exact count client-side afterwards if you need one.
     """
     _log(f"Image fetch: {len(models)} model(s), max_workers={max_workers} "
-         f"(max_pages={max_pages}, max_versions={max_versions})...")
+         f"(max_pages={max_pages}, max_versions={max_versions}, media_type={media_type}, "
+         f"require_meta={require_meta}, limit_total={limit_total})...")
     t0 = time.monotonic()
     reset_stats()
     results = []
+
+    stop_event = threading.Event() if limit_total else None
+    counter = {"n": 0} if limit_total else None
+    counter_lock = threading.Lock() if limit_total else None
+
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
-            pool.submit(fetch_model_images, m, since, max_pages, nsfw, max_versions): m
+            pool.submit(fetch_model_images, m, since, max_pages, nsfw, max_versions, media_type,
+                        require_meta, stop_event, counter, counter_lock, limit_total): m
             for m in models
         }
         done = _wait_all_with_heartbeat(futures.keys(), "Image fetch")
@@ -168,6 +237,149 @@ def fetch_images_for_models(models, since, max_workers=MAX_WORKERS, max_pages=20
     _log(f"  requests={s['requests']} ok={s['ok']} rate_limited_429={s['rate_limited']} "
          f"exceptions={s['exceptions']} gave_up={s['gave_up']}")
     return results
+
+
+def get_images_by_username(username, since, page_limit=100, max_pages=20, nsfw="X", require_meta=True,
+                            stop_event=None, counter=None, counter_lock=None, limit_total=None):
+    """
+    Like get_recent_images_with_meta, but paginates /images filtered by
+    UPLOADER username directly (Civitai's own `username` filter on /images)
+    instead of by modelVersionId. This is everything the creator has ever
+    posted to the gallery — including images made with someone else's
+    model/checkpoint — not just the showcase images on models they own.
+
+    No server-side `type` filter here either — see get_recent_images_with_meta
+    for why; media-type filtering happens client-side in fetch_images_by_username.
+
+    require_meta=True (default): sends withMeta=true. Some creators strip/hide
+    their prompts entirely — Civitai then returns a nextCursor forever with
+    zero items per page rather than a clean "no results" for that username.
+    Set require_meta=False to fetch bare records (no generation meta) instead.
+    """
+    collected = []
+    cursor = None
+    pages_fetched = 0
+    hit_page_cap = False
+
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            break
+
+        params = {
+            "username": username,
+            "sort": "Newest",
+            "limit": page_limit,
+        }
+        if require_meta:
+            params["withMeta"] = "true"
+        if nsfw:
+            params["nsfw"] = nsfw
+        if cursor:
+            params["cursor"] = cursor
+
+        r = _get_with_retry(f"{BASE}/images", params)
+        payload = r.json()
+        items = payload.get("items", [])
+
+        in_window = [img for img in items if img.get("createdAt", "") >= since]
+        collected.extend(in_window)
+
+        if counter is not None and in_window:
+            with counter_lock:
+                counter["n"] += len(in_window)
+                if limit_total and counter["n"] >= limit_total and stop_event is not None:
+                    stop_event.set()
+
+        pages_fetched += 1
+        next_cursor = payload.get("metadata", {}).get("nextCursor")
+        past_window = bool(items) and not in_window
+        no_more_pages = not next_cursor
+        hit_page_cap = pages_fetched >= max_pages
+        limit_hit = bool(stop_event is not None and stop_event.is_set())
+
+        if past_window or no_more_pages or hit_page_cap or limit_hit:
+            break
+        cursor = next_cursor
+
+    return collected, hit_page_cap
+
+
+def fetch_images_by_username(username, since, max_pages=20, nsfw="X", media_type=None, require_meta=True,
+                              limit_total=None):
+    """
+    Everything a creator has POSTED (uploader username filter), as opposed
+    to fetch_images_for_models() which only covers images attached to
+    models that creator themselves published. Single paginated stream, no
+    per-model fan-out — there's only one username to page through.
+
+    Since there's no owning model here, "modelId"/"modelName" on each entry
+    are left as None; the model/LoRA actually used to generate the image
+    (if any) shows up resolved inside meta.civitaiResources instead (see
+    resolve.enrich_resources).
+
+    media_type: "image" | "video" | "audio" — filtered CLIENT-SIDE against
+    each item's own "type" field after fetching (not sent to the API — see
+    get_images_by_username for why).
+    require_meta=True (default): only keep images with generation metadata.
+    Set False for creators who strip/hide their prompts — Civitai's API
+    otherwise returns a nextCursor forever with zero items per page for
+    those usernames rather than a clean "no results" (see
+    get_images_by_username).
+    """
+    _log(f"Image fetch (uploads scope): username={username} "
+         f"(max_pages={max_pages}, media_type={media_type}, require_meta={require_meta}, "
+         f"limit_total={limit_total})...")
+    t0 = time.monotonic()
+    reset_stats()
+
+    stop_event = threading.Event() if limit_total else None
+    counter = {"n": 0} if limit_total else None
+    counter_lock = threading.Lock() if limit_total else None
+
+    images, hit_cap = get_images_by_username(
+        username, since=since, max_pages=max_pages, nsfw=nsfw, require_meta=require_meta,
+        stop_event=stop_event, counter=counter, counter_lock=counter_lock, limit_total=limit_total,
+    )
+
+    entries = []
+    for img in images:
+        if require_meta and not img.get("meta"):
+            continue
+        if media_type and img.get("type") != media_type:
+            continue
+        meta = img.get("meta") or {}
+        civitai_resources = meta.get("civitaiResources") or []
+        checkpoint = next((r for r in civitai_resources if r.get("type") == "checkpoint"), None)
+        model_version_id = checkpoint.get("modelVersionId") if checkpoint else (img.get("modelVersionIds") or [None])[0]
+        entries.append({
+            "modelId": None,
+            "modelName": None,
+            "modelVersionId": model_version_id,
+            "modelUrl": None,
+            "baseModel": img.get("baseModel"),
+            "imageId": img["id"],
+            "imageUrl": img["url"],
+            "posterUsername": img.get("username"),
+            "postId": img.get("postId"),
+            "postUrl": f"{SITE}/posts/{img['postId']}" if img.get("postId") else None,
+            "width": img.get("width"),
+            "height": img.get("height"),
+            "createdAt": img.get("createdAt"),
+            "nsfwLevel": img.get("nsfwLevel") if img.get("nsfwLevel") != "None" else None,
+            "mediaType": img.get("type"),
+            "stats": img.get("stats"),
+            "reactionScore": reaction_score(img.get("stats")),
+            "meta": img.get("meta"),
+        })
+
+    cap_note = " [hit max_pages cap — window may be incomplete, consider raising max_pages]" if hit_cap else ""
+    elapsed = time.monotonic() - t0
+    s = get_stats()
+    _log(f"Image fetch done: {len(entries)} image(s) with meta for '{username}' in {elapsed:.2f}s{cap_note}")
+    _log(f"  requests={s['requests']} ok={s['ok']} rate_limited_429={s['rate_limited']} "
+         f"exceptions={s['exceptions']} gave_up={s['gave_up']}")
+    return entries
+
 
 
 def fetch_all(model_count=10, since_days=1, period="Month", max_workers=MAX_WORKERS, max_pages=20, nsfw="X",
