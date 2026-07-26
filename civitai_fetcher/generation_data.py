@@ -67,12 +67,15 @@ _HEADERS = {
 _session = requests.Session()
 _stats_lock = threading.Lock()
 _stats = {"requests": 0, "ok": 0, "no_data": 0, "errors": 0}
+_logged_no_data_sample = False
 
 
 def _reset_stats():
+    global _logged_no_data_sample
     with _stats_lock:
         for k in _stats:
             _stats[k] = 0
+        _logged_no_data_sample = False
 
 
 def _find_payload(node):
@@ -81,11 +84,22 @@ def _find_payload(node):
     {"resources": [...], "params": {...}} — the actual generation-data
     payload, regardless of which tRPC dehydration chunk it ended up in.
     Returns None if not found anywhere in this chunk.
+
+    Deliberately never descends into a "remixOf" key: that holds a full
+    record for a DIFFERENT image (the one this one was remixed from), which
+    can itself have its own resources/params. Without this guard, a video
+    with no generation params of its own would silently match its remix
+    ancestor's params instead — attributing someone else's (or an earlier)
+    generation to the wrong image. If the current image has no params of
+    its own, that's genuinely "no data", not a reason to borrow one from
+    somewhere else in the tree.
     """
     if isinstance(node, dict):
         if "resources" in node and "params" in node and isinstance(node.get("params"), dict):
             return node
-        for v in node.values():
+        for k, v in node.items():
+            if k == "remixOf":
+                continue
             found = _find_payload(v)
             if found is not None:
                 return found
@@ -135,7 +149,7 @@ def fetch_generation_data(image_id, timeout=15, max_retries=2):
             "while logged in. Treat it like a password — never commit it."
         )
 
-    params_json = json.dumps({"json": {"type": "image", "id": image_id, "withPreview": True, "authed": True}})
+    params_json = json.dumps({"0": {"json": {"type": "image", "id": image_id, "withPreview": True, "authed": True}}})
     url = f"{TRPC_URL}?batch=1&input={requests.utils.quote(params_json, safe='')}"
     headers = dict(_HEADERS)
     headers["cookie"] = COOKIE
@@ -169,8 +183,17 @@ def fetch_generation_data(image_id, timeout=15, max_retries=2):
                     break
 
             if payload is None:
+                global _logged_no_data_sample
                 with _stats_lock:
                     _stats["no_data"] += 1
+                    log_sample = not _logged_no_data_sample
+                    if log_sample:
+                        _logged_no_data_sample = True
+                if log_sample:
+                    print(f"  [generation_data] no payload found for image {image_id} (HTTP {r.status_code}) — "
+                          f"raw response sample (first no_data of this batch, to check for a disguised auth "
+                          f"failure — tRPC often returns HTTP 200 with an error body instead of 401/403):\n"
+                          f"    {r.text[:500]!r}", flush=True)
                 return None
 
             params = payload.get("params") or {}

@@ -39,6 +39,13 @@ from .resolve import enrich_resources, load_cache, save_cache
 from .generation_data import enrich_generation_data
 
 
+def _page_size_type(value):
+    ivalue = int(value)
+    if not (50 <= ivalue <= 200):
+        raise argparse.ArgumentTypeError(f"--page-size must be between 50 and 200 (got {ivalue})")
+    return ivalue
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Fetch images from one creator, newest first."
@@ -61,11 +68,19 @@ def main():
     parser.add_argument("--media-type", choices=["image", "video", "audio", "all"], default="all",
                         help="Only fetch images, videos, or audio posts (default: all).")
     parser.add_argument("--limit", type=int, default=None,
-                        help="Cap the number of items WRITTEN to the output JSON, applied after "
-                             "all filters (--media-type, --max-age-days, --types) and after sorting "
-                             "newest-first — i.e. the N most recent items that matched, and each of "
-                             "those N must still fall within --max-age-days. "
+                        help="Target number of items, ANDed with --max-age-days (an item must "
+                             "satisfy both). For --scope uploads: stops paging Civitai as soon as "
+                             "roughly this many in-window items are collected — checked between "
+                             "pages, not mid-page, so once a page is fetched it's kept in full "
+                             "rather than thrown away to hit an exact count (result may slightly "
+                             "overshoot --limit). For --scope models: applied as a hard cap after "
+                             "fetching (early-stop isn't wired up for this scope yet). "
                              "Default: no limit, write everything that matched.")
+    parser.add_argument("--page-size", type=_page_size_type, default=50,
+                        help="Items requested per Civitai API page (50-200, default: 50). Larger "
+                             "pages mean fewer round-trips but bigger individual responses — each "
+                             "page's response time/size is logged so this can be tuned from real "
+                             "runs.")
     parser.add_argument("--enrich-meta", action="store_true",
                         help="For entries still missing generation meta after the normal fetch, "
                              "try Civitai's internal per-image endpoint as a second pass (one HTTP "
@@ -77,10 +92,9 @@ def main():
     # --- internal / advanced flags (hidden from --help) ---
     SUPPRESS = argparse.SUPPRESS
     parser.add_argument("--model-limit", type=int, default=1000, help=SUPPRESS)
-    parser.add_argument("--max-pages", type=int, default=IMAGES_MAX_PAGES, help=SUPPRESS)
+    parser.add_argument("--max-pages", type=int, default=None, help=SUPPRESS)
     parser.add_argument("--max-versions", type=int, default=None, help=SUPPRESS)
     parser.add_argument("--nsfw", default=IMAGES_NSFW, help=SUPPRESS)
-    parser.add_argument("--top-resources", type=int, default=0, help=SUPPRESS)
     parser.add_argument("--resolve-resources", dest="resolve_resources", action="store_true", default=True, help=SUPPRESS)
     parser.add_argument("--no-resolve-resources", dest="resolve_resources", action="store_false", help=SUPPRESS)
     args = parser.parse_args()
@@ -88,14 +102,30 @@ def main():
     since = (datetime.now(timezone.utc) - timedelta(days=args.max_age_days)).isoformat().replace("+00:00", "Z")
     media_type = None if args.media_type == "all" else args.media_type
 
+    # max_pages is an implementation-level safety cap, not something a user
+    # should need to think about — but it still needs a value. If the user
+    # explicitly passed --max-pages, that always wins. Otherwise: for
+    # --scope uploads with --limit set, limit_total already bounds the
+    # fetch (see images.py), so there's no need for a page-count ceiling on
+    # top of it — drop it (float("inf")). --scope models doesn't have
+    # limit_total wired up yet, so it keeps the default cap regardless of
+    # --limit, otherwise --limit would stop bounding anything there at all.
+    if args.max_pages is not None:
+        effective_max_pages = args.max_pages
+    elif args.scope == "uploads" and args.limit:
+        effective_max_pages = float("inf")
+    else:
+        effective_max_pages = IMAGES_MAX_PAGES
+
     if args.scope == "uploads":
         # No model discovery — one paginated stream over the uploader's
         # own username covers everything they've ever posted. Meta or no
         # meta, keep it all — some creators simply don't have generation
         # metadata attached to (some or all of) their posts, and that's not
         # a reason to drop the image/video itself.
-        entries = fetch_images_by_username(args.username, since, max_pages=args.max_pages, nsfw=args.nsfw,
-                                            media_type=media_type, require_meta=False)
+        entries = fetch_images_by_username(args.username, since, max_pages=effective_max_pages, nsfw=args.nsfw,
+                                            media_type=media_type, require_meta=False,
+                                            page_size=args.page_size, limit_total=args.limit)
         if not entries:
             print(f"No posted images/videos found for '{args.username}' in the given window.")
             return
@@ -113,14 +143,11 @@ def main():
 
         # Step 2: fetch every image in-window across all of those models,
         # meta or no meta (see uploads-scope comment above).
-        entries = fetch_images_for_models(models, since, max_pages=args.max_pages, nsfw=args.nsfw,
+        entries = fetch_images_for_models(models, since, max_pages=effective_max_pages, nsfw=args.nsfw,
                                            max_versions=args.max_versions, media_type=media_type,
-                                           require_meta=False)
+                                           require_meta=False, page_size=args.page_size)
 
-    if args.resolve_resources:
-        load_cache()
-        entries = enrich_resources(entries)
-        save_cache()
+    fetched_count = len(entries)
 
     # Step 3: dedup by imageId (same image can appear under multiple model
     # versions if a post is shared).
@@ -142,16 +169,24 @@ def main():
 
     # Belt-and-braces: --max-age-days and --limit are an AND, not an OR — every
     # item written must satisfy both. The age cutoff is already applied while
-    # fetching (see images.py), but re-checking here means this guarantee holds
-    # regardless of how entries got here.
-    if args.max_age_days:
-        before = len(ranked)
-        ranked = [e for e in ranked if (e.get("createdAt") or "") >= since]
-        if len(ranked) < before:
-            print(f"Dropped {before - len(ranked)} item(s) older than --max-age-days={args.max_age_days}")
+    # fetching (see images.py) via the `since` check on every page, so this is
+    # already guaranteed and not re-checked here.
 
-    if args.limit and len(ranked) > args.limit:
+    # --scope models has no early-stop wired up yet (see fetch_images_for_models
+    # call above — limit_total isn't passed), so --limit is applied as a hard
+    # cap here instead. --scope uploads already stopped fetching once enough
+    # in-window items were collected (limit_total), and keeps whatever full
+    # page it landed on rather than being trimmed again here.
+    if args.scope == "models" and args.limit and len(ranked) > args.limit:
         ranked = ranked[:args.limit]
+
+    # Resource-name resolution (LoRA/checkpoint lookups) is a network call per
+    # unique resource — run it on the final, already-limited set, not on
+    # everything fetched before trimming.
+    if args.resolve_resources:
+        load_cache()
+        ranked = enrich_resources(ranked)
+        save_cache()
 
     if args.enrich_meta:
         missing_before = sum(1 for e in ranked if not e.get("meta"))
@@ -182,7 +217,7 @@ def main():
             json.dump(issues, f, indent=2)
         print(f"Wrote issues to {issues_path}")
 
-    print(f"\nWrote {len(ranked)} image(s) (of {len(entries)} fetched) from '{args.username}', "
+    print(f"\nWrote {len(ranked)} image(s) (of {fetched_count} fetched) from '{args.username}', "
           f"newest first, to {out_path}")
     print("Most recent 10:")
     for e in ranked[:10]:

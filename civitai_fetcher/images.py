@@ -88,9 +88,13 @@ def get_recent_images_with_meta(model_version_id, since, page_limit=100, max_pag
         if cursor:
             params["cursor"] = cursor
 
+        t_page = time.monotonic()
         r = _get_with_retry(f"{BASE}/images", params)
+        page_seconds = time.monotonic() - t_page
         payload = r.json()
         items = payload.get("items", [])
+        _log(f"    page {pages_fetched + 1} (version {model_version_id}, page_size={page_limit}): "
+             f"{page_seconds:.2f}s, {len(r.content)} bytes, {len(items)} item(s)")
 
         in_window = [img for img in items if img.get("createdAt", "") >= since]
         collected.extend(in_window)
@@ -116,7 +120,8 @@ def get_recent_images_with_meta(model_version_id, since, page_limit=100, max_pag
 
 
 def fetch_model_images(model, since, max_pages=20, nsfw="X", max_versions=None, media_type=None,
-                        require_meta=True, stop_event=None, counter=None, counter_lock=None, limit_total=None):
+                        require_meta=True, stop_event=None, counter=None, counter_lock=None, limit_total=None,
+                        page_size=100):
     """
     Fetch all images created since `since` (ISO timestamp) across a model's
     versions. If max_versions is set, only the newest N versions are queried
@@ -148,8 +153,9 @@ def fetch_model_images(model, since, max_pages=20, nsfw="X", max_versions=None, 
             continue
         try:
             images, hit_cap = get_recent_images_with_meta(
-                version_id, since=since, max_pages=max_pages, nsfw=nsfw, require_meta=require_meta,
-                stop_event=stop_event, counter=counter, counter_lock=counter_lock, limit_total=limit_total,
+                version_id, since=since, page_limit=page_size, max_pages=max_pages, nsfw=nsfw,
+                require_meta=require_meta, stop_event=stop_event, counter=counter,
+                counter_lock=counter_lock, limit_total=limit_total,
             )
         except Exception as e:
             print(f"  {model_name} ({model_id}) version {version_id} skipped, error: {e}", flush=True)
@@ -194,7 +200,7 @@ def fetch_model_images(model, since, max_pages=20, nsfw="X", max_versions=None, 
 
 
 def fetch_images_for_models(models, since, max_workers=MAX_WORKERS, max_pages=20, nsfw="X", max_versions=None,
-                             media_type=None, require_meta=True, limit_total=None):
+                             media_type=None, require_meta=True, limit_total=None, page_size=100):
     """
     Fetch images for an already-discovered/ranked list of model dicts —
     e.g. the Week-ranked output of activity.probe_candidates(). This is the
@@ -227,7 +233,7 @@ def fetch_images_for_models(models, since, max_workers=MAX_WORKERS, max_pages=20
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
             pool.submit(fetch_model_images, m, since, max_pages, nsfw, max_versions, media_type,
-                        require_meta, stop_event, counter, counter_lock, limit_total): m
+                        require_meta, stop_event, counter, counter_lock, limit_total, page_size): m
             for m in models
         }
         done = _wait_all_with_heartbeat(futures.keys(), "Image fetch")
@@ -279,9 +285,13 @@ def get_images_by_username(username, since, page_limit=100, max_pages=20, nsfw="
         if cursor:
             params["cursor"] = cursor
 
+        t_page = time.monotonic()
         r = _get_with_retry(f"{BASE}/images", params)
+        page_seconds = time.monotonic() - t_page
         payload = r.json()
         items = payload.get("items", [])
+        _log(f"    page {pages_fetched + 1} (username={username}, page_size={page_limit}): "
+             f"{page_seconds:.2f}s, {len(r.content)} bytes, {len(items)} item(s)")
 
         in_window = [img for img in items if img.get("createdAt", "") >= since]
         collected.extend(in_window)
@@ -307,7 +317,7 @@ def get_images_by_username(username, since, page_limit=100, max_pages=20, nsfw="
 
 
 def fetch_images_by_username(username, since, max_pages=20, nsfw="X", media_type=None, require_meta=True,
-                              limit_total=None):
+                              limit_total=None, page_size=100):
     """
     Everything a creator has POSTED (uploader username filter), as opposed
     to fetch_images_for_models() which only covers images attached to
@@ -329,8 +339,8 @@ def fetch_images_by_username(username, since, max_pages=20, nsfw="X", media_type
     get_images_by_username).
     """
     _log(f"Image fetch (uploads scope): username={username} "
-         f"(max_pages={max_pages}, media_type={media_type}, require_meta={require_meta}, "
-         f"limit_total={limit_total})...")
+         f"(page_size={page_size}, max_pages={max_pages}, media_type={media_type}, "
+         f"require_meta={require_meta}, limit_total={limit_total})...")
     t0 = time.monotonic()
     reset_stats()
 
@@ -339,7 +349,7 @@ def fetch_images_by_username(username, since, max_pages=20, nsfw="X", media_type
     counter_lock = threading.Lock() if limit_total else None
 
     images, hit_cap = get_images_by_username(
-        username, since=since, max_pages=max_pages, nsfw=nsfw, require_meta=require_meta,
+        username, since=since, page_limit=page_size, max_pages=max_pages, nsfw=nsfw, require_meta=require_meta,
         stop_event=stop_event, counter=counter, counter_lock=counter_lock, limit_total=limit_total,
     )
 
