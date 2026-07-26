@@ -46,19 +46,23 @@ def get_recent_images_with_meta(model_version_id, since, page_limit=100, max_pag
     quirk, civitai/civitai#1277). "X" is the highest content tier and reliably
     returns the full range, not just X-rated images specifically.
 
-    No `type`/media-type filter is sent here deliberately — Civitai's own
-    server-side filters have a documented habit of silently no-op'ing once
-    combined with other params (e.g. civitai/civitai#1848, #2134). The JSON
-    fetch is cheap either way, so media-type filtering is applied client-side
-    afterwards instead (see fetch_model_images) — same principle as the
-    createdAt window filter below, which was already client-side.
+    No `withMeta` param is sent here, deliberately, regardless of require_meta.
+    Combining `username`/other filters with `withMeta=true` has the same
+    documented failure shape as other Civitai filter combos (silently
+    returning zero items with a nextCursor that never terminates, rather
+    than a clean "no results" — e.g. civitai/civitai#1848, #2134): a creator
+    who visibly has meta'd images in the browser can still come back empty
+    from this endpoint if withMeta is in the query. Since the plain response
+    already includes `meta` when it exists, "has meta or not" is instead
+    checked client-side per item after fetching (see fetch_model_images) —
+    require_meta only controls whether items without it get dropped, not
+    what's sent to the API.
 
-    require_meta=True (default): sends withMeta=true, matching this tool's
-    original purpose (generation metadata). Some creators strip/hide their
-    prompts entirely (e.g. custom pipelines, or deliberately private), and
-    Civitai's API then returns a nextCursor forever with zero items on every
-    page rather than a clean "no results" — set require_meta=False to skip
-    withMeta and fetch bare image/video records (no meta) for those cases.
+    No `type`/media-type filter is sent here deliberately either — same
+    silent-no-op pattern. The JSON fetch is cheap either way, so media-type
+    filtering is also applied client-side afterwards (see fetch_model_images)
+    — same principle as the createdAt window filter below, which was
+    already client-side.
 
     stop_event/counter/counter_lock/limit_total: an optional shared early-stop
     mechanism across models running in parallel (see fetch_images_for_models).
@@ -79,8 +83,6 @@ def get_recent_images_with_meta(model_version_id, since, page_limit=100, max_pag
             "sort": "Newest",
             "limit": page_limit,
         }
-        if require_meta:
-            params["withMeta"] = "true"
         if nsfw:
             params["nsfw"] = nsfw
         if cursor:
@@ -251,10 +253,12 @@ def get_images_by_username(username, since, page_limit=100, max_pages=20, nsfw="
     No server-side `type` filter here either — see get_recent_images_with_meta
     for why; media-type filtering happens client-side in fetch_images_by_username.
 
-    require_meta=True (default): sends withMeta=true. Some creators strip/hide
-    their prompts entirely — Civitai then returns a nextCursor forever with
-    zero items per page rather than a clean "no results" for that username.
-    Set require_meta=False to fetch bare records (no generation meta) instead.
+    No `withMeta` param is sent here either, deliberately, regardless of
+    require_meta — the combo with `username` is what produced the "0 items,
+    nextCursor forever" symptom for creators who visibly do have meta'd
+    images in the browser. `meta` is present in the plain response when it
+    exists; require_meta only controls whether items without it get dropped,
+    client-side, in fetch_images_by_username.
     """
     collected = []
     cursor = None
@@ -270,8 +274,6 @@ def get_images_by_username(username, since, page_limit=100, max_pages=20, nsfw="
             "sort": "Newest",
             "limit": page_limit,
         }
-        if require_meta:
-            params["withMeta"] = "true"
         if nsfw:
             params["nsfw"] = nsfw
         if cursor:

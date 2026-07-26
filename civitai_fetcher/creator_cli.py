@@ -36,6 +36,7 @@ from .client import get_popular_models
 from .images import fetch_images_for_models, fetch_images_by_username
 from .validate import validate_results
 from .resolve import enrich_resources, load_cache, save_cache
+from .generation_data import enrich_generation_data
 
 
 def main():
@@ -65,12 +66,13 @@ def main():
                              "newest-first — i.e. the N most recent items that matched, and each of "
                              "those N must still fall within --max-age-days. "
                              "Default: no limit, write everything that matched.")
-    parser.add_argument("--allow-no-meta", action="store_true",
-                        help="Also include images/videos with no generation metadata attached "
-                             "(default: skipped). Needed for creators who strip/hide their prompts "
-                             "entirely — Civitai's API otherwise returns nothing at all for them "
-                             "(a nextCursor forever with zero items per page) rather than a clean "
-                             "'no results', since withMeta=true excludes everything they've posted.")
+    parser.add_argument("--enrich-meta", action="store_true",
+                        help="For entries still missing generation meta after the normal fetch, "
+                             "try Civitai's internal per-image endpoint as a second pass (one HTTP "
+                             "call per image — only applied to the final, already-limited set, so "
+                             "cost scales with --limit, not the whole gallery). Requires the "
+                             "CIVITAI_COOKIE env var (your logged-in session cookie) — unofficial, "
+                             "best-effort, and every failure is caught and skipped, never fatal.")
 
     # --- internal / advanced flags (hidden from --help) ---
     SUPPRESS = argparse.SUPPRESS
@@ -88,9 +90,12 @@ def main():
 
     if args.scope == "uploads":
         # No model discovery — one paginated stream over the uploader's
-        # own username covers everything they've ever posted.
+        # own username covers everything they've ever posted. Meta or no
+        # meta, keep it all — some creators simply don't have generation
+        # metadata attached to (some or all of) their posts, and that's not
+        # a reason to drop the image/video itself.
         entries = fetch_images_by_username(args.username, since, max_pages=args.max_pages, nsfw=args.nsfw,
-                                            media_type=media_type, require_meta=not args.allow_no_meta)
+                                            media_type=media_type, require_meta=False)
         if not entries:
             print(f"No posted images/videos found for '{args.username}' in the given window.")
             return
@@ -106,10 +111,11 @@ def main():
         for m in models:
             print(f"  {m.get('name', 'Unknown')[:60]:60s} ({m.get('type', '?')})")
 
-        # Step 2: fetch every image in-window across all of those models.
+        # Step 2: fetch every image in-window across all of those models,
+        # meta or no meta (see uploads-scope comment above).
         entries = fetch_images_for_models(models, since, max_pages=args.max_pages, nsfw=args.nsfw,
                                            max_versions=args.max_versions, media_type=media_type,
-                                           require_meta=not args.allow_no_meta)
+                                           require_meta=False)
 
     if args.resolve_resources:
         load_cache()
@@ -146,6 +152,13 @@ def main():
 
     if args.limit and len(ranked) > args.limit:
         ranked = ranked[:args.limit]
+
+    if args.enrich_meta:
+        missing_before = sum(1 for e in ranked if not e.get("meta"))
+        if missing_before:
+            ranked = enrich_generation_data(ranked, only_missing=True)
+        else:
+            print("[generation_data] skipped — every item in the final set already has meta")
 
     # Tag output filenames with creator + run date/time, same rationale as
     # images_cli.py — re-runs while tuning flags shouldn't silently overwrite

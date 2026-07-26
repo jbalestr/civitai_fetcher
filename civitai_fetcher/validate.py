@@ -17,8 +17,14 @@ def validate_entry(entry):
         except ValueError:
             issues.append(f"unparseable_meta_size: {meta_size!r}")
 
-    # missing expected static fields
-    for field in ("imageId", "imageUrl", "modelId", "modelUrl"):
+    # missing expected static fields — modelId/modelUrl are deliberately
+    # excluded here. They're always populated for scope=models entries
+    # (set directly from the model dict) and always None for scope=uploads
+    # entries (there's no owning model by definition — see creator_cli.py's
+    # --scope uploads). So their absence is never actually an anomaly with
+    # the current fetch pipeline, just noise from a shape that legitimately
+    # doesn't have that field.
+    for field in ("imageId", "imageUrl"):
         if not entry.get(field):
             issues.append(f"missing_{field}")
 
