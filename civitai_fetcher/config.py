@@ -50,6 +50,11 @@ IMAGES_PERIOD = "Week"
 IMAGES_SINCE_DAYS = 7
 IMAGES_TOP_MODELS = 20      # how many activity-ranked models (by velocity_per_day) to pull images for
 IMAGES_MAX_PAGES = FETCH_MAX_PAGES
+IMAGES_MAX_PAGES_SAFETY_CAP = 2000  # real ceiling used instead of "no cap at all" when --limit
+                                     # drops the normal max_pages default (see creator_cli.py) —
+                                     # at page_size=200 that's 400k items, well past anything a
+                                     # real --limit would ask for; it's a backstop against a
+                                     # pathological infinite-cursor case, not a normal use limit.
 IMAGES_NSFW = FETCH_NSFW
 IMAGES_TOP_REACTIONS = 30   # how many top-reaction images to keep/print, 0 = keep all
 

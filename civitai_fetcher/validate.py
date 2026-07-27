@@ -1,21 +1,6 @@
 def validate_entry(entry):
     """Return a list of issue strings for one entry, empty if clean."""
     issues = []
-    meta = entry.get("meta") or {}
-
-    # size mismatch: meta.Size (generation-time) vs actual file width/height
-    # these legitimately differ when an image is upscaled/resized after generation
-    meta_size = meta.get("Size")
-    if meta_size and "x" in str(meta_size):
-        try:
-            meta_w, meta_h = (int(x) for x in str(meta_size).lower().split("x"))
-            if entry.get("width") != meta_w or entry.get("height") != meta_h:
-                issues.append(
-                    f"size_mismatch: file={entry.get('width')}x{entry.get('height')} "
-                    f"meta={meta_w}x{meta_h}"
-                )
-        except ValueError:
-            issues.append(f"unparseable_meta_size: {meta_size!r}")
 
     # missing expected static fields — modelId/modelUrl are deliberately
     # excluded here. They're always populated for scope=models entries

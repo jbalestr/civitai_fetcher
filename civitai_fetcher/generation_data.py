@@ -256,6 +256,9 @@ def enrich_generation_data(entries, only_missing=True, max_workers=6):
     print(f"[generation_data] enriching {len(targets)}/{len(entries)} entries via internal endpoint "
           f"(max_workers={max_workers})...")
     t0 = time.monotonic()
+    completed = 0
+    last_log = t0
+    log_interval_seconds = 3.0
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(fetch_generation_data, e["imageId"]): e for e in targets}
@@ -268,6 +271,12 @@ def enrich_generation_data(entries, only_missing=True, max_workers=6):
                 continue
             if data is not None:
                 entry["meta"] = data
+            completed += 1
+            now = time.monotonic()
+            if now - last_log >= log_interval_seconds or completed == len(targets):
+                print(f"  [generation_data] {completed}/{len(targets)} ({now - t0:.1f}s) — "
+                      f"ok={_stats['ok']} no_data={_stats['no_data']} errors={_stats['errors']}", flush=True)
+                last_log = now
 
     elapsed = time.monotonic() - t0
     print(f"[generation_data] done in {elapsed:.1f}s — ok={_stats['ok']} no_data={_stats['no_data']} "

@@ -20,6 +20,7 @@ full window newest-first (same as the old code) and rank reactions ourselves.
 """
 import time
 import threading
+import requests
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -38,8 +39,11 @@ def get_recent_images_with_meta(model_version_id, since, page_limit=100, max_pag
     everything after that point is guaranteed older too), when pagination
     runs out, or when max_pages is hit.
 
-    Returns (collected, hit_page_cap) so callers can tell whether the window
-    was fully captured or truncated by the page limit.
+    Returns (collected, hit_page_cap, request_failed) so callers can tell
+    whether the window was fully captured, truncated by the page limit, or
+    cut short by a persistent request failure (e.g. Civitai's own 503s under
+    load) — the latter still returns everything collected up to that point
+    rather than raising and losing it.
 
     nsfw="X": without an explicit nsfw param, Civitai's /images endpoint silently
     excludes NSFW items regardless of your actual access level (documented API
@@ -73,6 +77,7 @@ def get_recent_images_with_meta(model_version_id, since, page_limit=100, max_pag
     cursor = None
     pages_fetched = 0
     hit_page_cap = False
+    request_failed = False
 
     while True:
         if stop_event is not None and stop_event.is_set():
@@ -89,7 +94,14 @@ def get_recent_images_with_meta(model_version_id, since, page_limit=100, max_pag
             params["cursor"] = cursor
 
         t_page = time.monotonic()
-        r = _get_with_retry(f"{BASE}/images", params)
+        try:
+            r = _get_with_retry(f"{BASE}/images", params)
+        except requests.exceptions.RequestException as exc:
+            _log(f"    page {pages_fetched + 1} (version {model_version_id}, page_size={page_limit}): "
+                 f"FAILED after retries — stopping here, keeping {len(collected)} item(s) collected so "
+                 f"far. ({exc})")
+            request_failed = True
+            break
         page_seconds = time.monotonic() - t_page
         payload = r.json()
         items = payload.get("items", [])
@@ -116,7 +128,7 @@ def get_recent_images_with_meta(model_version_id, since, page_limit=100, max_pag
             break
         cursor = next_cursor
 
-    return collected, hit_page_cap
+    return collected, hit_page_cap, request_failed
 
 
 def fetch_model_images(model, since, max_pages=20, nsfw="X", max_versions=None, media_type=None,
@@ -144,6 +156,7 @@ def fetch_model_images(model, since, max_pages=20, nsfw="X", max_versions=None, 
 
     entries = []
     any_version_hit_cap = False
+    any_version_request_failed = False
 
     for version in versions:
         if stop_event is not None and stop_event.is_set():
@@ -152,7 +165,7 @@ def fetch_model_images(model, since, max_pages=20, nsfw="X", max_versions=None, 
         if not version_id:
             continue
         try:
-            images, hit_cap = get_recent_images_with_meta(
+            images, hit_cap, request_failed = get_recent_images_with_meta(
                 version_id, since=since, page_limit=page_size, max_pages=max_pages, nsfw=nsfw,
                 require_meta=require_meta, stop_event=stop_event, counter=counter,
                 counter_lock=counter_lock, limit_total=limit_total,
@@ -163,6 +176,8 @@ def fetch_model_images(model, since, max_pages=20, nsfw="X", max_versions=None, 
 
         if hit_cap:
             any_version_hit_cap = True
+        if request_failed:
+            any_version_request_failed = True
 
         for img in images:
             if require_meta and not img.get("meta"):
@@ -194,8 +209,10 @@ def fetch_model_images(model, since, max_pages=20, nsfw="X", max_versions=None, 
 
     cap_note = " [hit max_pages cap on at least one version — window may be incomplete, consider raising max_pages]" \
         if any_version_hit_cap else ""
+    fail_note = " [a request failed after retries on at least one version — window may be incomplete]" \
+        if any_version_request_failed else ""
     meta_note = "images with meta" if require_meta else "images (meta not required)"
-    print(f"  {model_name} ({model_id}): {len(entries)} {meta_note} since {since}{cap_note}", flush=True)
+    print(f"  {model_name} ({model_id}): {len(entries)} {meta_note} since {since}{cap_note}{fail_note}", flush=True)
     return entries
 
 
@@ -270,6 +287,7 @@ def get_images_by_username(username, since, page_limit=100, max_pages=20, nsfw="
     cursor = None
     pages_fetched = 0
     hit_page_cap = False
+    request_failed = False
 
     while True:
         if stop_event is not None and stop_event.is_set():
@@ -286,7 +304,14 @@ def get_images_by_username(username, since, page_limit=100, max_pages=20, nsfw="
             params["cursor"] = cursor
 
         t_page = time.monotonic()
-        r = _get_with_retry(f"{BASE}/images", params)
+        try:
+            r = _get_with_retry(f"{BASE}/images", params)
+        except requests.exceptions.RequestException as exc:
+            _log(f"    page {pages_fetched + 1} (username={username}, page_size={page_limit}): "
+                 f"FAILED after retries — stopping here, keeping {len(collected)} item(s) collected so "
+                 f"far. ({exc})")
+            request_failed = True
+            break
         page_seconds = time.monotonic() - t_page
         payload = r.json()
         items = payload.get("items", [])
@@ -313,7 +338,7 @@ def get_images_by_username(username, since, page_limit=100, max_pages=20, nsfw="
             break
         cursor = next_cursor
 
-    return collected, hit_page_cap
+    return collected, hit_page_cap, request_failed
 
 
 def fetch_images_by_username(username, since, max_pages=20, nsfw="X", media_type=None, require_meta=True,
@@ -348,7 +373,7 @@ def fetch_images_by_username(username, since, max_pages=20, nsfw="X", media_type
     counter = {"n": 0} if limit_total else None
     counter_lock = threading.Lock() if limit_total else None
 
-    images, hit_cap = get_images_by_username(
+    images, hit_cap, request_failed = get_images_by_username(
         username, since=since, page_limit=page_size, max_pages=max_pages, nsfw=nsfw, require_meta=require_meta,
         stop_event=stop_event, counter=counter, counter_lock=counter_lock, limit_total=limit_total,
     )
@@ -385,9 +410,11 @@ def fetch_images_by_username(username, since, max_pages=20, nsfw="X", media_type
         })
 
     cap_note = " [hit max_pages cap — window may be incomplete, consider raising max_pages]" if hit_cap else ""
+    fail_note = " [a request failed after retries — window may be incomplete, results so far kept]" \
+        if request_failed else ""
     elapsed = time.monotonic() - t0
     s = get_stats()
-    _log(f"Image fetch done: {len(entries)} image(s) with meta for '{username}' in {elapsed:.2f}s{cap_note}")
+    _log(f"Image fetch done: {len(entries)} image(s) with meta for '{username}' in {elapsed:.2f}s{cap_note}{fail_note}")
     _log(f"  requests={s['requests']} ok={s['ok']} rate_limited_429={s['rate_limited']} "
          f"exceptions={s['exceptions']} gave_up={s['gave_up']}")
     return entries

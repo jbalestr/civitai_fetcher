@@ -31,7 +31,7 @@ import argparse
 import json
 from datetime import datetime, timedelta, timezone
 
-from .config import OUT_PATH, ISSUES_PATH, IMAGES_MAX_PAGES, IMAGES_NSFW
+from .config import OUT_PATH, ISSUES_PATH, IMAGES_MAX_PAGES, IMAGES_MAX_PAGES_SAFETY_CAP, IMAGES_NSFW
 from .client import get_popular_models
 from .images import fetch_images_for_models, fetch_images_by_username
 from .validate import validate_results
@@ -113,7 +113,7 @@ def main():
     if args.max_pages is not None:
         effective_max_pages = args.max_pages
     elif args.scope == "uploads" and args.limit:
-        effective_max_pages = float("inf")
+        effective_max_pages = IMAGES_MAX_PAGES_SAFETY_CAP
     else:
         effective_max_pages = IMAGES_MAX_PAGES
 
