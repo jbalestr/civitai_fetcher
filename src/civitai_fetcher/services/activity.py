@@ -10,8 +10,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from .config import BASE, MAX_WORKERS, PHASE_TIMEOUT_SECONDS, MODEL_TIMEOUT_SECONDS, BACKOFF_CAP
-from .client import _get_with_retry, _log, get_stats, reset_stats, get_popular_models, _wait_with_heartbeat
+from ..core.config import BASE, MAX_WORKERS, PHASE_TIMEOUT_SECONDS, MODEL_TIMEOUT_SECONDS, BACKOFF_CAP
+from ..core.client import _get_with_retry, _log, get_stats, reset_stats, get_popular_models, _wait_with_heartbeat
 
 
 def probe_model_activity(model, since, page_limit, nsfw, rank, deep_probe_limit):

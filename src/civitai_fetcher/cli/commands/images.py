@@ -3,40 +3,43 @@ Find popular Civitai models by CURRENT activity (not just historical
 downloads — see README "Discoveries"), then pull their images ranked by
 community reactions.
 
-This is the replacement for the old, broken `civitai-fetcher` CLI
-(civitai_fetcher.cli / fetch_all). That command imported a fetch_all that
-no longer existed after the codebase split into activity.py (model ranking)
-and images.py (image fetching) — see git history around commit 1df2185.
-
 Pipeline:
-  1. activity.probe_candidates()  — rank models by download popularity, then
-     probe each for recent post-count (Tier 1/2) and optionally sustained
-     velocity (Tier 3b) — same logic probe.py uses.
+  1. services.activity.probe_candidates() — rank models by download
+     popularity, then probe each for recent post-count (Tier 1/2) and
+     optionally sustained velocity (Tier 3b) — same logic probe.py uses.
   2. Take the top --top-models by that ranking.
-  3. images.fetch_images_for_models() — pull every meta'd image in the
-     window for just those models (not the whole candidate pool).
-  4. images.sort_by_reactions() — rank pulled images by combined reaction
-     count, client-side (see images.py for why this isn't done via the API).
+  3. services.fetch.fetch_images_for_models() — pull every meta'd image in
+     the window for just those models (not the whole candidate pool).
+  4. services.quality.filter_by_min_reactions() — drop the noise floor.
+     This step matters specifically HERE and not in the creator/model
+     commands: this pipeline's candidate pool comes from the general
+     activity-ranked firehose, which is mostly images nobody looked at
+     twice. A named creator/model command is already a curated source,
+     so the same gate there would just discard legitimate low-reaction
+     work rather than filter noise.
+  5. services.quality.sort_by_reactions() — rank survivors by combined
+     reaction count, client-side (see fetch.py for why this isn't done
+     via the API).
 """
 import argparse
 import json
 from datetime import datetime
 
-from .config import (
+from ...core.config import (
     OUT_PATH, ISSUES_PATH,
     IMAGES_PERIOD, IMAGES_SINCE_DAYS, IMAGES_TOP_MODELS, IMAGES_MAX_PAGES, IMAGES_NSFW,
     IMAGES_TOP_REACTIONS,
     PROBE_CANDIDATE_COUNT, PROBE_PAGE_LIMIT, PROBE_DEEP_PROBE_LIMIT, PROBE_TYPES,
     PROBE_VELOCITY_WINDOW_DAYS, PROBE_VELOCITY_MAX_PAGES,
 )
-from .activity import probe_candidates, add_velocity
-from .images import (
-    fetch_images_for_models, sort_by_reactions, sort_by_reactions_per_model,
+from ...services.activity import probe_candidates, add_velocity
+from ...services.fetch import fetch_images_for_models
+from ...services.quality import (
+    sort_by_reactions, sort_by_reactions_per_model, filter_by_min_reactions,
     count_resource_usage, count_bare_checkpoint_usage,
 )
-from .validate import validate_results
-from .resolve import enrich_resources, load_cache, save_cache
-
+from ...core.validate import validate_results
+from ...services.enrichment.resolve import enrich_resources, load_cache, save_cache
 
 
 # Per-period filter thresholds.
@@ -65,6 +68,12 @@ def main():
     )
     parser.add_argument("--period", default=IMAGES_PERIOD, choices=["Day", "Week", "Month"],
                         help=f"Window to rank model popularity/activity over (default: {IMAGES_PERIOD})")
+    parser.add_argument("--min-reactions", type=int, default=0,
+                        help="Drop images with reactionScore below this floor before ranking (default: 0, "
+                             "i.e. no gate). This pipeline's candidate pool is unfiltered activity data, mostly "
+                             "noise — even --min-reactions 1 removes most zero-reaction uploads nobody has "
+                             "looked at twice. Not applied by the creator/model commands, which are already "
+                             "curated sources.")
     parser.add_argument("--top-reactions-per-model", type=int, default=50,
                         help="Keep the top N images PER MODEL ranked by community reactions (default: 50). "
                              "Every active model contributes equally regardless of overall popularity — "
@@ -175,7 +184,14 @@ def main():
         print(f"Deduped {len(entries) - len(deduped)} duplicate imageId(s)")
     entries = deduped
 
-    # Step 4: rank by reactions, client-side (see images.py docstring for why).
+    # Step 4: quality gate — drop the noise floor before ranking (see module
+    # docstring for why this lives here and not in the creator/model commands).
+    if args.min_reactions:
+        before_gate = len(entries)
+        entries = filter_by_min_reactions(entries, min_score=args.min_reactions)
+        print(f"Reaction floor (>= {args.min_reactions}): {len(entries)} of {before_gate} images kept")
+
+    # Step 5: rank by reactions, client-side (see fetch.py docstring for why).
     if args.top_reactions_per_model:
         ranked = sort_by_reactions_per_model(entries, top_n_per_model=args.top_reactions_per_model)
     else:

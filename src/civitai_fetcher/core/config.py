@@ -14,6 +14,15 @@ OUT_PATH = "output/civitai_output.json"
 ISSUES_PATH = "output/civitai_output_issues.json"
 RESOLVER_CACHE_PATH = "civitai_resolver_cache.json"
 
+# Generation-data enrichment cache: keyed by imageId, since a given image's
+# generation data is immutable once the image exists. Previously
+# generation_data.py had no cache at all, so every run re-hit the
+# authenticated internal endpoint for images already enriched before —
+# the riskiest/most expensive lookup in the tool, and the one most worth
+# caching. Caches both successful enrichment AND confirmed "no data
+# available" results, so a known-empty image isn't retried forever either.
+GENERATION_CACHE_PATH = "civitai_generation_cache.json"
+
 # --- HTTP / retry tuning (_get_with_retry in fetch.py) ---
 REQUEST_TIMEOUT = 15        # seconds, per request
 MAX_RETRIES = 3             # attempts before giving up

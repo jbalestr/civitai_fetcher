@@ -32,8 +32,8 @@ Three independent pattern signals, each answering a different question:
      exact match is a strict floor that's always correct when it fires.
 
 Use:
-    uv run python -m civitai_fetcher.patterns_cli output/*.json
-    uv run python -m civitai_fetcher.patterns_cli output/wai0731_uploads.json --min-images 5
+    uv run civitai-fetcher patterns output/*.json
+    uv run civitai-fetcher patterns output/wai0731_uploads.json --min-images 5
 """
 import argparse
 import json

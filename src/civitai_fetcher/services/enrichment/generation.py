@@ -3,13 +3,13 @@ Per-image generation-data enrichment via Civitai's INTERNAL tRPC endpoint
 (generation.getGenerationData), the same call the website itself makes when
 you open an image's detail view.
 
-This is deliberately separate from client.py/images.py, which only ever
+This is deliberately separate from core.client/fetch.py, which only ever
 talk to the documented public /api/v1. Reasons this exists at all:
 
   - Some creators' images come back with meta=null from /api/v1, even
     though the browser clearly shows a prompt/resources panel for them
     (confirmed by hand, DevTools Network tab, civitai.red/images/<id>).
-  - The public endpoint has documented combo-filter bugs (see images.py);
+  - The public endpoint has documented combo-filter bugs (see fetch.py);
     this isn't one of those — the data is either not exposed via /api/v1
     at all, or is exposed differently than what the site's own detail
     view uses internally.
@@ -25,9 +25,17 @@ WHAT THIS NEEDS, AND WHY IT'S DIFFERENT FROM THE REST OF THE TOOL:
     every call as best-effort: catch failures, never let one bad image
     stop the batch.
   - Because of both of the above, this is opt-in only (--enrich-meta in
-    creator_cli.py) and deliberately only ever run against an already
+    the creator CLI) and deliberately only ever run against an already
     filtered/limited set of entries, never the full fetch — cost should
     scale with --limit, not with how many images a creator has.
+
+CACHING: keyed by imageId via cache.KeyedDiskCache, since a given image's
+generation data is immutable once the image exists — this is the most
+expensive/riskiest lookup in the tool (authenticated, unofficial, one
+request per image, no bulk equivalent) and previously had no cache at
+all, so a "no data available" result is also cached, not just a hit —
+otherwise a known-empty image gets hit again on every future run for no
+reason.
 
 RESPONSE FORMAT:
 tRPC with `trpc-accept: application/jsonl` streams the response as
@@ -47,7 +55,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
-from .config import SITE
+from ...core.config import SITE, GENERATION_CACHE_PATH
+from .cache import KeyedDiskCache
 
 TRPC_URL = f"{SITE}/api/trpc/generation.getGenerationData"
 
@@ -66,8 +75,24 @@ _HEADERS = {
 
 _session = requests.Session()
 _stats_lock = threading.Lock()
-_stats = {"requests": 0, "ok": 0, "no_data": 0, "errors": 0}
+_stats = {"requests": 0, "ok": 0, "no_data": 0, "errors": 0, "cache_hits": 0}
 _logged_no_data_sample = False
+
+_cache = KeyedDiskCache(GENERATION_CACHE_PATH)
+DATA = "generation_data"  # imageId (str) -> meta dict, or {"__no_data__": True}
+
+
+def load_cache(path=GENERATION_CACHE_PATH):
+    """Load generation-data cache from disk, if present. Call before enriching."""
+    global _cache
+    if path != _cache.path:
+        _cache = KeyedDiskCache(path)
+    _cache.load()
+
+
+def save_cache(path=GENERATION_CACHE_PATH):
+    """Persist generation-data cache to disk. Call after enriching."""
+    _cache.save()
 
 
 def _reset_stats():
@@ -130,17 +155,9 @@ def _to_civitai_resources(resources):
     return out
 
 
-def fetch_generation_data(image_id, timeout=15, max_retries=2):
-    """
-    Fetch generation data for one image via the internal tRPC endpoint.
-    Returns a dict shaped like the public API's `meta` field (prompt,
-    negativePrompt, civitaiResources, etc.) on success, or None if there's
-    genuinely nothing there / the request fails after retries.
-
-    Every failure mode is caught here and turned into None — this is
-    best-effort, unofficial, and a single bad image must never take down
-    a batch (see enrich_generation_data).
-    """
+def _fetch_generation_data_uncached(image_id, timeout=15, max_retries=2):
+    """The actual network call — see fetch_generation_data for the cached
+    entry point everything else should use instead."""
     if not COOKIE:
         raise RuntimeError(
             "CIVITAI_COOKIE is not set. Export your session cookie first, e.g.:\n"
@@ -225,20 +242,48 @@ def fetch_generation_data(image_id, timeout=15, max_retries=2):
             return None
 
 
+def fetch_generation_data(image_id, timeout=15, max_retries=2):
+    """
+    Fetch generation data for one image via the internal tRPC endpoint.
+    Returns a dict shaped like the public API's `meta` field (prompt,
+    negativePrompt, civitaiResources, etc.) on success, or None if there's
+    genuinely nothing there / the request fails after retries.
+
+    Cache-backed: a confirmed "no data" result is cached the same as a hit,
+    since re-fetching a genuinely empty image costs the same as fetching a
+    real one — there's no cheaper way to ask "did this change" than asking
+    outright, and it hasn't changed once the image exists.
+    """
+    if _cache.contains(DATA, image_id):
+        with _stats_lock:
+            _stats["cache_hits"] += 1
+        cached = _cache.get(DATA, image_id)
+        return None if cached == {"__no_data__": True} else cached
+
+    result = _fetch_generation_data_uncached(image_id, timeout=timeout, max_retries=max_retries)
+    _cache.set(DATA, image_id, result if result is not None else {"__no_data__": True})
+    return result
+
+
 def enrich_generation_data(entries, only_missing=True, max_workers=6):
     """
     Fill in entry["meta"] via the internal endpoint for entries that don't
     already have it (only_missing=True, the default) — or for all entries
     if you explicitly want to re-fetch/override.
 
-    Deliberately low max_workers (6) and deliberately NOT reusing client.py's
-    connection pool/session: this hits an unofficial, cookie-authenticated
-    endpoint, not the public API — keep it gentle, not parallelized like
-    the bulk /api/v1 fetches elsewhere in this tool.
+    Deliberately low max_workers (6) and deliberately NOT reusing
+    core.client's connection pool/session: this hits an unofficial,
+    cookie-authenticated endpoint, not the public API — keep it gentle,
+    not parallelized like the bulk /api/v1 fetches elsewhere in this tool.
 
     Call this on an already-filtered/limited list — e.g. after --limit has
-    been applied in creator_cli.py — not on a full unbounded fetch. Cost is
-    one HTTP request per image, no bulk/paginated equivalent exists.
+    been applied in the creator CLI — not on a full unbounded fetch. Cost
+    is one HTTP request per NOT-YET-CACHED image; repeat runs against the
+    same images are free once cached.
+
+    Caller is responsible for load_cache()/save_cache() around this, same
+    pattern as resolve.py — not done automatically here so callers can
+    batch multiple enrichment calls under one load/save pair if useful.
     """
     _reset_stats()
     targets = [e for e in entries if not only_missing or not e.get("meta")]
@@ -275,10 +320,11 @@ def enrich_generation_data(entries, only_missing=True, max_workers=6):
             now = time.monotonic()
             if now - last_log >= log_interval_seconds or completed == len(targets):
                 print(f"  [generation_data] {completed}/{len(targets)} ({now - t0:.1f}s) — "
-                      f"ok={_stats['ok']} no_data={_stats['no_data']} errors={_stats['errors']}", flush=True)
+                      f"ok={_stats['ok']} no_data={_stats['no_data']} errors={_stats['errors']} "
+                      f"cache_hits={_stats['cache_hits']}", flush=True)
                 last_log = now
 
     elapsed = time.monotonic() - t0
     print(f"[generation_data] done in {elapsed:.1f}s — ok={_stats['ok']} no_data={_stats['no_data']} "
-          f"errors={_stats['errors']} (of {_stats['requests']} requests)")
+          f"errors={_stats['errors']} cache_hits={_stats['cache_hits']} (of {_stats['requests']} requests)")
     return entries

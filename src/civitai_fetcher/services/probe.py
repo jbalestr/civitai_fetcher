@@ -4,10 +4,10 @@ import re
 import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime
-from civitai_fetcher.activity import probe_candidates, add_velocity
-from civitai_fetcher.client import _log
+from .activity import probe_candidates, add_velocity
+from ..core.client import _log
 import time
-from civitai_fetcher.config import (
+from ..core.config import (
     PROBE_CANDIDATE_COUNT, PROBE_PERIOD, PROBE_SINCE_DAYS, PROBE_TYPES,
     PROBE_PAGE_LIMIT, PROBE_DEEP_PROBE_LIMIT, PROBE_NSFW,
     PROBE_VELOCITY_TOP_N, PROBE_VELOCITY_WINDOW_DAYS, PROBE_VELOCITY_MAX_PAGES,

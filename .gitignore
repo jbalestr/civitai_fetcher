@@ -1,14 +1,15 @@
-@"
 __pycache__/
 *.pyc
-.env
-civitai_output.json
-civitai_output_issues.json
-civitai_fetcher.egg-info/
-*.csv
-*.png
-*_cache.json
-"@ | Out-File -Encoding utf8 -FilePath .gitignore
-*.html
+.venv/
+*.egg-info/
+build/
+dist/
 
+# run outputs and caches — regenerable, not source
 output/
+civitai_output*.json
+civitai_issues*.json
+civitai_resolver_cache.json
+civitai_generation_cache.json
+*.png
+trend_summary.csv

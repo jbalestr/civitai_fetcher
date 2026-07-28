@@ -50,7 +50,7 @@ validate.py   — flags suspicious/incomplete records in fetched output.
 
 ```bash
 uv sync
-uv run python -m civitai_fetcher.images_cli --top-models 10
+uv run civitai-fetcher images --top-models 10
 ```
 
 Pipeline:
@@ -119,7 +119,7 @@ combined `reactionScore` (sum of like/heart/laugh/cry/comment counts) afterward,
 ### probe — activity ranking only, no image fetching
 
 ```bash
-uv run python -m civitai_fetcher.probe
+uv run civitai-fetcher probe
 ```
 
 Zero-arg default does the full ranking pipeline in one reasonable-length run: discover a
@@ -301,7 +301,7 @@ being saved by abandoning it anyway.
 --velocity-top-n 150` run completed with almost no `o` markers (retry-then-succeed) and zero `X`
 markers (exhausted retries) — meaning the API had capacity to spare at those settings. Current
 defaults are roughly double what was proven safe, specifically so a **zero-argument run**
-(`python -m civitai_fetcher.probe`) does something useful in one shot without hand-tuning. If you
+(`civitai-fetcher probe`) does something useful in one shot without hand-tuning. If you
 ever see the cap-hit warnings mentioned above during a default run, that's the signal these need
 raising again — don't guess, read the warning, it names the exact flag.
 

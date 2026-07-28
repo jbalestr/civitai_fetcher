@@ -19,8 +19,8 @@ the final sort just guarantees that order holds once multiple models'/
 versions' streams are merged).
 
 Use:
-    uv run python -m civitai_fetcher.model_cli --model-name "Detail Tweaker"
-    uv run python -m civitai_fetcher.model_cli --model-id 58390
+    uv run civitai-fetcher models --model-name "Detail Tweaker"
+    uv run civitai-fetcher models --model-id 58390
 """
 import argparse
 import json
@@ -29,12 +29,12 @@ import sys
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timedelta, timezone
 
-from .config import OUT_PATH, ISSUES_PATH, IMAGES_MAX_PAGES, IMAGES_NSFW
-from .client import get_popular_models
-from .images import fetch_images_for_models
-from .validate import validate_results
-from .resolve import enrich_resources, load_cache, save_cache
-from .generation_data import enrich_generation_data
+from ...core.config import OUT_PATH, ISSUES_PATH, IMAGES_MAX_PAGES, IMAGES_NSFW
+from ...core.client import get_popular_models
+from ...services.fetch import fetch_images_for_models
+from ...core.validate import validate_results
+from ...services.enrichment.resolve import enrich_resources, load_cache as load_resolver_cache, save_cache as save_resolver_cache
+from ...services.enrichment.generation import enrich_generation_data, load_cache as load_generation_cache, save_cache as save_generation_cache
 
 
 def _page_size_type(value):
@@ -242,14 +242,16 @@ def main():
         ranked = ranked[:args.limit]
 
     if args.resolve_resources:
-        load_cache()
+        load_resolver_cache()
         ranked = enrich_resources(ranked)
-        save_cache()
+        save_resolver_cache()
 
     if args.enrich_meta:
         missing_before = sum(1 for e in ranked if not e.get("meta"))
         if missing_before:
+            load_generation_cache()
             ranked = enrich_generation_data(ranked, only_missing=True)
+            save_generation_cache()
         else:
             print("[generation_data] skipped — every item in the final set already has meta")
 
@@ -280,8 +282,8 @@ def main():
     # expect the output file to be a bare list of entries, so run provenance goes
     # alongside it instead of wrapping/breaking that shape.
     run_meta = {
-        "generatingCli": "model_cli",
-        "commandLine": "uv run python -m civitai_fetcher.model_cli " + " ".join(
+        "generatingCli": "civitai-fetcher models",
+        "commandLine": "uv run civitai-fetcher models " + " ".join(
             f'"{a}"' if " " in a else a for a in sys.argv[1:]
         ),
         "generatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),

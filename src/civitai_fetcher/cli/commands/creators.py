@@ -24,19 +24,19 @@ not a numeric user ID — there's no numeric-userId filter for /models, and
 resolve it to a username via civitai.com/user/... first.
 
 Use:
-    uv run python -m civitai_fetcher.creator_cli --username WAI0731
-    uv run python -m civitai_fetcher.creator_cli --username WAI0731 --scope models
+    uv run civitai-fetcher creators --username WAI0731
+    uv run civitai-fetcher creators --username WAI0731 --scope models
 """
 import argparse
 import json
 from datetime import datetime, timedelta, timezone
 
-from .config import OUT_PATH, ISSUES_PATH, IMAGES_MAX_PAGES, IMAGES_MAX_PAGES_SAFETY_CAP, IMAGES_NSFW
-from .client import get_popular_models
-from .images import fetch_images_for_models, fetch_images_by_username
-from .validate import validate_results
-from .resolve import enrich_resources, load_cache, save_cache
-from .generation_data import enrich_generation_data
+from ...core.config import OUT_PATH, ISSUES_PATH, IMAGES_MAX_PAGES, IMAGES_MAX_PAGES_SAFETY_CAP, IMAGES_NSFW
+from ...core.client import get_popular_models
+from ...services.fetch import fetch_images_for_models, fetch_images_by_username
+from ...core.validate import validate_results
+from ...services.enrichment.resolve import enrich_resources, load_cache as load_resolver_cache, save_cache as save_resolver_cache
+from ...services.enrichment.generation import enrich_generation_data, load_cache as load_generation_cache, save_cache as save_generation_cache
 
 
 def _page_size_type(value):
@@ -184,14 +184,16 @@ def main():
     # unique resource — run it on the final, already-limited set, not on
     # everything fetched before trimming.
     if args.resolve_resources:
-        load_cache()
+        load_resolver_cache()
         ranked = enrich_resources(ranked)
-        save_cache()
+        save_resolver_cache()
 
     if args.enrich_meta:
         missing_before = sum(1 for e in ranked if not e.get("meta"))
         if missing_before:
+            load_generation_cache()
             ranked = enrich_generation_data(ranked, only_missing=True)
+            save_generation_cache()
         else:
             print("[generation_data] skipped — every item in the final set already has meta")
 
