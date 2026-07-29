@@ -8,7 +8,8 @@ vector DB (Qdrant) pipeline.
 
 Working end-to-end: model discovery, concurrent activity probing (download rank → recent-activity
 rank → sustained-velocity rank), image fetching with generation metadata, reaction ranking,
-resource-name resolution, resource-usage analysis, trend analysis. **Not yet done:** the Qdrant
+resource-name resolution, resource-usage analysis, trend analysis, SQLite storage (normalised
+schema, automatic upsert on every fetch, backup/restore, browsable). **Not yet done:** the Qdrant
 loader / embedding step (see Roadmap).
 
 The old `civitai_fetcher.cli` (`fetch_all`) was broken for a while — see `Architecture` below for
@@ -23,6 +24,7 @@ what replaced it. `civitai_fetcher.cli` is now a deprecated shim that just point
 | `civitai_fetcher.probe` | Rank a download-popular candidate pool by *current* image activity, writes CSV + HTML report + chart. `images_cli` builds on this. |
 | `analyse_trends.py` | Standalone script — trend charts from an existing `images_cli`/old `cli` output JSON |
 | `civitai_fetcher.cli` | Deprecated shim — points you at `images_cli` instead of doing anything itself |
+| `scripts/*.py` (`browse.py`, `backup_db.py`, `restore_db.py`, `replay_json_to_db.py`, `backfill_resource_names.py`) | SQLite storage tools — see "DB storage" below |
 
 ## Architecture
 
@@ -189,6 +191,42 @@ Optional `max_span_days` excludes models whose data spans an unusually wide date
 Image-centric, not model-centric: one entry per image, model fields repeated per row. This suits
 filtering/aggregation and eventual embedding better than nesting images under models.
 
+## DB storage (SQLite)
+
+Every fetcher command (`images_cli`, `models_cli`, `creators_cli`) writes to `output/civitai.db`
+automatically, in addition to the usual JSON file — no separate step required. Pass `--no-db` to
+skip it and get JSON-only output, same as before this feature existed.
+
+**Schema** — normalised out of the repeated-per-image JSON shape above:
+
+| Table | What's in it |
+|---|---|
+| `images` | One row per image: `imageId` (PK), FKs to `models`/`resources`, plus `prompt`, `negativePrompt`, `sampler`, `steps`, `cfgScale`, `media_type`, `first_seen_at`, `enriched_at` |
+| `models` | One row per model (`modelId`, `modelName`, `modelUrl`) — not repeated per image |
+| `resources` | One row per LoRA/checkpoint version (`modelVersionId`, `name`, `versionName`, `creatorUsername`, `resource_type`) |
+| `image_resources` | Join table — which resources (and at what weight) each image used |
+| `image_stats` | Append-only history of `likeCount`/`heartCount`/.../`reactionScore` per image per fetch — refreshing an image later adds a new row rather than overwriting, so reaction growth over time stays queryable |
+| `raw_meta` | The full original `meta` payload per image, zlib-compressed (ComfyUI/ Krea/Anima workflow graphs can be 100KB+ uncompressed; compresses ~4-20x depending on how repetitive the payload is) |
+
+`enriched_at` is set automatically based on the data itself (every attached resource has a
+resolved name), not by a separate manual step — so replaying an already-`--enrich-meta`'d JSON
+file correctly marks those rows enriched on the way in.
+
+**Tools** (all under `scripts/`):
+
+| Script | Purpose |
+|---|---|
+| `replay_json_to_db.py <file.json ...>` | Backfill the DB from existing JSON output files — no API calls. Accepts globs. |
+| `backfill_resource_names.py [--dry-run]` | Re-resolve `resources` rows still missing `name`/`creatorUsername` (live API calls, uses the existing resolver cache). |
+| `backup_db.py [--vacuum]` | Online backup to `output/backups/civitai_<timestamp>.db` — safe to run while the DB is in use. `--vacuum` also defragments (smaller file, a bit slower). |
+| `restore_db.py --list` / `restore_db.py <backup path>` | List backups / restore one over the live DB (safety-copies the current DB first, prompts for confirmation unless `--yes`). |
+| `browse.py summary` / `top-images` / `top-resources` / `recent` / `search <text>` / `history <imageId>` / `meta <imageId>` | Ready-made read-only views — no SQL required for the common cases. Run `browse.py -h` for all options. |
+
+**Known quirk:** `civitaiResources` field naming is only consistent as of this DB feature —
+entries enriched via `resolve.py` use `name`, entries enriched via `--enrich-meta`'s internal
+endpoint used to use `modelName` instead (now fixed to also use `name`). `db/store.py`'s upsert
+still checks both field names for backward compatibility with JSON files written before this fix.
+
 ## Known data quirks
 
 - `meta.Size` (generation-time size) can legitimately differ from `width`/`height` (actual file)
@@ -304,10 +342,3 @@ defaults are roughly double what was proven safe, specifically so a **zero-argum
 (`civitai-fetcher probe`) does something useful in one shot without hand-tuning. If you
 ever see the cap-hit warnings mentioned above during a default run, that's the signal these need
 raising again — don't guess, read the warning, it names the exact flag.
-
-## Roadmap
-
-- [ ] Qdrant loader: embed `prompt` (+ optionally `negativePrompt`), rest as filterable payload
-- [ ] Optional CLIP pass for character/landscape + gender classification
-- [ ] Normalise checkpoint+LoRA combo usage per-checkpoint (currently raw counts, so a
-      high-volume checkpoint dominates the list regardless of how *consistently* it uses a LoRA)
