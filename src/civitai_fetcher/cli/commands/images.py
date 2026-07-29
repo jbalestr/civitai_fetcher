@@ -31,7 +31,9 @@ from ...core.config import (
     IMAGES_TOP_REACTIONS,
     PROBE_CANDIDATE_COUNT, PROBE_PAGE_LIMIT, PROBE_DEEP_PROBE_LIMIT, PROBE_TYPES,
     PROBE_VELOCITY_WINDOW_DAYS, PROBE_VELOCITY_MAX_PAGES,
+    DB_PATH,
 )
+from ...db import write_to_db
 from ...services.activity import probe_candidates, add_velocity
 from ...services.fetch import fetch_images_for_models
 from ...services.quality import (
@@ -83,6 +85,8 @@ def main():
                         help="Keep the top N images GLOBALLY across all models (default: 30). "
                              "Only used when --top-reactions-per-model is 0. "
                              "Warning: a single high-reaction model can dominate the output.")
+    parser.add_argument("--no-db", action="store_true",
+                        help=f"Skip writing to the DB ({DB_PATH}) -- JSON file output only.")
 
     # --- internal / advanced flags (hidden from --help) ---
     SUPPRESS = argparse.SUPPRESS
@@ -209,6 +213,9 @@ def main():
     import pathlib; pathlib.Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
         json.dump(ranked, f, indent=2)
+
+    if not args.no_db:
+        write_to_db(ranked, DB_PATH)
 
     issues = validate_results(ranked)
     if issues:

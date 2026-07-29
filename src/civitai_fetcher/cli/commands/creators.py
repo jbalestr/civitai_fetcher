@@ -31,7 +31,8 @@ import argparse
 import json
 from datetime import datetime, timedelta, timezone
 
-from ...core.config import OUT_PATH, ISSUES_PATH, IMAGES_MAX_PAGES, IMAGES_MAX_PAGES_SAFETY_CAP, IMAGES_NSFW
+from ...core.config import OUT_PATH, ISSUES_PATH, IMAGES_MAX_PAGES, IMAGES_MAX_PAGES_SAFETY_CAP, IMAGES_NSFW, DB_PATH
+from ...db import write_to_db
 from ...core.client import get_popular_models
 from ...services.fetch import fetch_images_for_models, fetch_images_by_username
 from ...core.validate import validate_results
@@ -81,6 +82,8 @@ def main():
                              "pages mean fewer round-trips but bigger individual responses — each "
                              "page's response time/size is logged so this can be tuned from real "
                              "runs.")
+    parser.add_argument("--no-db", action="store_true",
+                        help=f"Skip writing to the DB ({DB_PATH}) -- JSON file output only.")
     parser.add_argument("--enrich-meta", action="store_true",
                         help="For entries still missing generation meta after the normal fetch, "
                              "try Civitai's internal per-image endpoint as a second pass (one HTTP "
@@ -180,14 +183,13 @@ def main():
     if args.scope == "models" and args.limit and len(ranked) > args.limit:
         ranked = ranked[:args.limit]
 
-    # Resource-name resolution (LoRA/checkpoint lookups) is a network call per
-    # unique resource — run it on the final, already-limited set, not on
-    # everything fetched before trimming.
-    if args.resolve_resources:
-        load_resolver_cache()
-        ranked = enrich_resources(ranked)
-        save_resolver_cache()
-
+    # enrich_generation_data() runs BEFORE enrich_resources(), not after: it's
+    # the only thing that can add civitaiResources at all for entries whose
+    # public-API meta came back null. Running resolve_resources() first meant
+    # it only ever saw whatever civitaiResources already existed pre-
+    # generation_data -- often zero -- so creatorUsername/name never got
+    # filled in for anything generation_data added. This order guarantees
+    # resolve_resources() sees the complete, final resource list.
     if args.enrich_meta:
         missing_before = sum(1 for e in ranked if not e.get("meta"))
         if missing_before:
@@ -196,6 +198,14 @@ def main():
             save_generation_cache()
         else:
             print("[generation_data] skipped — every item in the final set already has meta")
+
+    # Resource-name resolution (LoRA/checkpoint lookups) is a network call per
+    # unique resource — run it on the final, already-limited set, not on
+    # everything fetched before trimming.
+    if args.resolve_resources:
+        load_resolver_cache()
+        ranked = enrich_resources(ranked)
+        save_resolver_cache()
 
     # Tag output filenames with creator + run date/time, same rationale as
     # images_cli.py — re-runs while tuning flags shouldn't silently overwrite
@@ -212,6 +222,9 @@ def main():
     import pathlib; pathlib.Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
         json.dump(ranked, f, indent=2)
+
+    if not args.no_db:
+        write_to_db(ranked, DB_PATH)
 
     issues = validate_results(ranked)
     if issues:

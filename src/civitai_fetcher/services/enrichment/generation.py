@@ -138,16 +138,18 @@ def _find_payload(node):
 
 def _to_civitai_resources(resources):
     """Reshape the tRPC resource list into this tool's existing
-    meta.civitaiResources shape (type/modelVersionId/modelName/weight),
-    so downstream code (resolve.py, output consumers) doesn't need to
-    know or care which source a given entry's meta came from."""
+    meta.civitaiResources shape (type/modelVersionId/name/weight) --
+    matches resolve.py's field naming exactly (name, not modelName) so
+    downstream code (resolve.py, db/store.py, output consumers) never
+    needs to know or care which enrichment source a given entry's meta
+    came from."""
     out = []
     for r in resources or []:
         model = r.get("model") or {}
         out.append({
             "type": (model.get("type") or "").lower(),
             "modelVersionId": r.get("id"),
-            "modelName": model.get("name"),
+            "name": model.get("name"),
             "modelId": model.get("id"),
             "weight": r.get("strength"),
             "air": r.get("air"),

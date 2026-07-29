@@ -10,6 +10,7 @@ HEADERS = {"Authorization": f"Bearer {API_TOKEN}"} if API_TOKEN else {}
 
 MAX_WORKERS = 24            # bumped from 8 — logs showed 0 rate-limit hits, so there was headroom
 POOL_MAXSIZE = 32            # HTTP connection pool size — should be >= MAX_WORKERS so no thread blocks waiting for a free connection
+DB_PATH = "output/civitai.db"
 OUT_PATH = "output/civitai_output.json"
 ISSUES_PATH = "output/civitai_output_issues.json"
 RESOLVER_CACHE_PATH = "civitai_resolver_cache.json"
