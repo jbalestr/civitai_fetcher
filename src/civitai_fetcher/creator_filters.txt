@@ -1,0 +1,7 @@
+# Creator block list.
+# One entry per line: username: block
+# Comparison is case-insensitive against the image's posterUsername (uploader).
+# Blank lines and lines starting with # are ignored.
+#
+# Example:
+FutaWorld: block

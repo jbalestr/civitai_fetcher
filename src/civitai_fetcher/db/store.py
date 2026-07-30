@@ -5,9 +5,15 @@ Takes entries in the same shape images_cli/creators_cli already produce (see
 README "Output shape") -- no upstream fetch/enrichment code needs to change,
 this just replaces the final json.dump() step.
 """
+import csv
 import json
+import os
 import zlib
 from datetime import datetime, timezone
+
+from ..core.config import SPAM_LOG_PATH, CREATOR_FILTERS_PATH, BLOCKED_LOG_PATH
+from ..services.quality import is_checkpoint_spam
+from ..services.creator_filters import load_creator_filters, is_blocked
 
 
 def _now():
@@ -21,9 +27,51 @@ def _media_type(entry):
     return entry.get("mediaType") or entry.get("type") or "image"
 
 
+def _log_checkpoint_spam(entry, civitai_resources, log_path=SPAM_LOG_PATH):
+    """
+    Append-only record of every entry upsert_entries discards as
+    checkpoint spam, so there's a durable trail of what got thrown away
+    and why -- separate from the DB itself, since the whole point is these
+    never get a row there. Writes a CSV header once if the file is new;
+    every call after that just appends one line, so this is safe to call
+    from concurrent/repeated runs without clobbering earlier entries.
+    """
+    checkpoint_count = sum(1 for r in civitai_resources if r.get("type") == "checkpoint")
+    os.makedirs(os.path.dirname(log_path), exist_ok=True) if os.path.dirname(log_path) else None
+    is_new = not os.path.exists(log_path)
+    with open(log_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if is_new:
+            writer.writerow(["loggedAt", "imageId", "postId", "posterUsername", "checkpointCount", "mediaType"])
+        writer.writerow([
+            _now(), entry.get("imageId"), entry.get("postId"), entry.get("posterUsername"),
+            checkpoint_count, _media_type(entry),
+        ])
+    print(f"  [spam] discarding imageId={entry.get('imageId')} postId={entry.get('postId')} "
+          f"({checkpoint_count} checkpoints) -- logged to {log_path}")
+
+
+def _log_blocked_creator(entry, log_path=BLOCKED_LOG_PATH):
+    """
+    Same append-only pattern as _log_checkpoint_spam, for images discarded
+    because their posterUsername is in creator_filters.txt.
+    """
+    os.makedirs(os.path.dirname(log_path), exist_ok=True) if os.path.dirname(log_path) else None
+    is_new = not os.path.exists(log_path)
+    with open(log_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if is_new:
+            writer.writerow(["loggedAt", "imageId", "postId", "posterUsername", "mediaType"])
+        writer.writerow([
+            _now(), entry.get("imageId"), entry.get("postId"), entry.get("posterUsername"), _media_type(entry),
+        ])
+    print(f"  [blocked] discarding imageId={entry.get('imageId')} postId={entry.get('postId')} "
+          f"posterUsername={entry.get('posterUsername')} -- logged to {log_path}")
+
+
 def upsert_entries(conn, entries, fetched_at=None):
     """
-    Upsert a batch of image entries. Returns (new_count, updated_count).
+    Upsert a batch of image entries. Returns (new_count, updated_count, skipped_count).
 
     - models / resources: plain upsert, since they're small and repeat a lot.
     - images: upsert on imageId. first_seen_at is only set on first insert
@@ -36,13 +84,37 @@ def upsert_entries(conn, entries, fetched_at=None):
     - raw_meta: compressed with zlib, replaced if the entry is re-fetched
       (meta itself is immutable per image, so this is a no-op after the
       first insert in practice).
+    - entries flagged by quality.is_checkpoint_spam (checkpoint-type
+      resources beyond a threshold, video/audio exempted) are discarded
+      outright, not just stripped -- an uploader gaming discoverability
+      makes the whole blob untrustworthy, so nothing from that entry gets
+      written at all.
+    - entries whose posterUsername is in creator_filters.txt (see
+      services.creator_filters) are likewise discarded outright.
+
+    Returns (new_count, updated_count, skipped_spam_count, skipped_blocked_count).
     """
     fetched_at = fetched_at or _now()
     now = _now()
     new_count = 0
     updated_count = 0
+    skipped_count = 0
+    skipped_blocked_count = 0
+    creator_filters = load_creator_filters(CREATOR_FILTERS_PATH)
 
     for entry in entries:
+        if is_blocked(entry.get("posterUsername"), creator_filters):
+            _log_blocked_creator(entry)
+            skipped_blocked_count += 1
+            continue
+
+        meta = entry.get("meta") or {}
+        civitai_resources = meta.get("civitaiResources") or []
+        if is_checkpoint_spam(civitai_resources, media_type=_media_type(entry)):
+            _log_checkpoint_spam(entry, civitai_resources)
+            skipped_count += 1
+            continue
+
         model_id = entry.get("modelId")
         if model_id is not None:
             conn.execute(
@@ -51,22 +123,36 @@ def upsert_entries(conn, entries, fetched_at=None):
                 (model_id, entry.get("modelName"), entry.get("modelUrl")),
             )
 
-        meta = entry.get("meta") or {}
-        civitai_resources = meta.get("civitaiResources") or []
         for res in civitai_resources:
             vid = res.get("modelVersionId")
             if vid is None:
                 continue
+
+            # civitaiResources entries carry the resource's own modelId
+            # alongside modelVersionId -- capture it even on creator-scope
+            # fetches (where entry.get("modelId") above is always None),
+            # so a checkpoint used in a creator fetch can still be traced
+            # back to its model via resources.modelId.
+            res_model_id = res.get("modelId")
+            if res_model_id is not None:
+                conn.execute(
+                    """INSERT INTO models (modelId, modelName, modelUrl) VALUES (?, ?, ?)
+                       ON CONFLICT(modelId) DO UPDATE SET
+                         modelName=COALESCE(models.modelName, excluded.modelName)""",
+                    (res_model_id, res.get("modelName") or res.get("name"), None),
+                )
+
             conn.execute(
-                """INSERT INTO resources (modelVersionId, name, versionName, creatorUsername, resource_type)
-                   VALUES (?, ?, ?, ?, ?)
+                """INSERT INTO resources (modelVersionId, name, versionName, creatorUsername, resource_type, modelId)
+                   VALUES (?, ?, ?, ?, ?, ?)
                    ON CONFLICT(modelVersionId) DO UPDATE SET
                      name=COALESCE(excluded.name, resources.name),
                      versionName=COALESCE(excluded.versionName, resources.versionName),
                      creatorUsername=COALESCE(excluded.creatorUsername, resources.creatorUsername),
-                     resource_type=COALESCE(excluded.resource_type, resources.resource_type)""",
+                     resource_type=COALESCE(excluded.resource_type, resources.resource_type),
+                     modelId=COALESCE(excluded.modelId, resources.modelId)""",
                 (vid, res.get("name") or res.get("modelName"), res.get("versionName"),
-                 res.get("creatorUsername"), res.get("type")),
+                 res.get("creatorUsername"), res.get("type"), res_model_id),
             )
 
         image_id = entry["imageId"]
@@ -163,7 +249,7 @@ def upsert_entries(conn, entries, fetched_at=None):
             )
 
     conn.commit()
-    return new_count, updated_count
+    return new_count, updated_count, skipped_count, skipped_blocked_count
 
 
 def get_raw_meta(conn, image_id):

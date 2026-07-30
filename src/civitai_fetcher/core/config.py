@@ -14,6 +14,9 @@ DB_PATH = "output/civitai.db"
 OUT_PATH = "output/civitai_output.json"
 ISSUES_PATH = "output/civitai_output_issues.json"
 RESOLVER_CACHE_PATH = "civitai_resolver_cache.json"
+SPAM_LOG_PATH = "output/checkpoint_spam_log.csv"  # appended to whenever upsert_entries discards a spammed image
+CREATOR_FILTERS_PATH = "creator_filters.txt"  # username: block list, see services/creator_filters.py
+BLOCKED_LOG_PATH = "output/blocked_creator_log.csv"  # appended to whenever upsert_entries discards a blocked-creator image
 
 # Generation-data enrichment cache: keyed by imageId, since a given image's
 # generation data is immutable once the image exists. Previously

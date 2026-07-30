@@ -20,8 +20,14 @@ def write_to_db(ranked, db_path):
     try:
         conn = get_connection(db_path)
         migrate(conn)
-        new_c, upd_c = upsert_entries(conn, ranked)
-        print(f"[db] upserted into {db_path}: {new_c} new, {upd_c} updated")
+        new_c, upd_c, skip_c, blocked_c = upsert_entries(conn, ranked)
+        notes = []
+        if skip_c:
+            notes.append(f"{skip_c} skipped (checkpoint spam)")
+        if blocked_c:
+            notes.append(f"{blocked_c} skipped (blocked creator)")
+        note_str = f", {', '.join(notes)}" if notes else ""
+        print(f"[db] upserted into {db_path}: {new_c} new, {upd_c} updated{note_str}")
         conn.close()
     except Exception as e:
         print(f"[db] WARNING: write to {db_path} failed, JSON output above is unaffected: {e}")

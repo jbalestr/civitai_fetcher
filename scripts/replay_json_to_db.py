@@ -38,12 +38,18 @@ def replay_file(conn, path):
 
     if not isinstance(data, list):
         print(f"  skipping {path}: not a list of image entries (issues/meta files aren't replayable)")
-        return 0, 0
+        return 0, 0, 0, 0
 
     fetched_at = _fetched_at_for_file(path)
-    new_c, upd_c = upsert_entries(conn, data, fetched_at=fetched_at)
-    print(f"  {path}: {len(data)} entries -> {new_c} new, {upd_c} updated")
-    return new_c, upd_c
+    new_c, upd_c, skip_c, blocked_c = upsert_entries(conn, data, fetched_at=fetched_at)
+    notes = []
+    if skip_c:
+        notes.append(f"{skip_c} skipped (checkpoint spam)")
+    if blocked_c:
+        notes.append(f"{blocked_c} skipped (blocked creator)")
+    note_str = f", {', '.join(notes)}" if notes else ""
+    print(f"  {path}: {len(data)} entries -> {new_c} new, {upd_c} updated{note_str}")
+    return new_c, upd_c, skip_c, blocked_c
 
 
 def main():
@@ -68,14 +74,17 @@ def main():
     conn = get_connection(DB_PATH)
     migrate(conn)
 
-    total_new, total_upd = 0, 0
+    total_new, total_upd, total_skip, total_blocked = 0, 0, 0, 0
     print(f"Replaying {len(candidate_paths)} file(s) into {DB_PATH}...")
     for path in candidate_paths:
-        n, u = replay_file(conn, path)
+        n, u, s, b = replay_file(conn, path)
         total_new += n
         total_upd += u
+        total_skip += s
+        total_blocked += b
 
-    print(f"Done: {total_new} new row(s), {total_upd} updated row(s) total.")
+    print(f"Done: {total_new} new row(s), {total_upd} updated row(s), "
+          f"{total_skip} skipped (checkpoint spam), {total_blocked} skipped (blocked creator) total.")
 
 
 if __name__ == "__main__":

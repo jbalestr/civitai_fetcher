@@ -77,8 +77,21 @@ def enrich_resources(results, max_workers=MAX_WORKERS):
     """
     Mutates each entry's meta.civitaiResources in place, adding "name",
     "versionName", and "creatorUsername" alongside the existing
-    "modelVersionId"/"type"/"weight". Cheap no-op for entries that don't
-    have civitaiResources.
+    "modelVersionId"/"type"/"weight".
+
+    Also resolves entry["modelVersionId"] (the checkpoint the image was
+    fetched under, per the top-level API field) even when
+    meta.civitaiResources is empty or entirely missing -- this is the
+    common case for creator/username-scope fetches without --enrich-meta,
+    where no generation meta ever came through, so the top-level field is
+    the ONLY place a checkpoint is recorded at all. Previously this field
+    was resolved nowhere, so store.py could only ever write a bare
+    unresolved FK stub for it (modelVersionId with no modelId/name),
+    leaving these images unable to roll up to their model. When resolved
+    and not already represented in civitaiResources, it's injected as a
+    synthetic checkpoint-type resource so store.py's existing
+    civitaiResources-based insert logic picks it up with no separate code
+    path needed.
 
     Two rounds, each concurrent: resolve versions -> modelIds first, since
     creator lookups need the modelId that only the version lookup provides.
@@ -91,6 +104,9 @@ def enrich_resources(results, max_workers=MAX_WORKERS):
             vid = res.get("modelVersionId")
             if vid:
                 all_version_ids.add(vid)
+        top_vid = entry.get("modelVersionId")
+        if top_vid:
+            all_version_ids.add(top_vid)
 
     to_fetch = [v for v in all_version_ids if not _cache.contains(VERSIONS, v)]
     print(f"Resolving {len(all_version_ids)} unique resource versions ({len(to_fetch)} not cached)...")
@@ -113,7 +129,8 @@ def enrich_resources(results, max_workers=MAX_WORKERS):
 
     for entry in results:
         meta = entry.get("meta") or {}
-        for res in meta.get("civitaiResources") or []:
+        civitai_resources = meta.get("civitaiResources") or []
+        for res in civitai_resources:
             vid = res.get("modelVersionId")
             if not vid:
                 continue
@@ -121,5 +138,21 @@ def enrich_resources(results, max_workers=MAX_WORKERS):
             res["name"] = info.get("name")
             res["versionName"] = info.get("versionName")
             res["creatorUsername"] = _cache.get(MODELS, info.get("modelId"))
+
+        top_vid = entry.get("modelVersionId")
+        already_present = any(r.get("modelVersionId") == top_vid for r in civitai_resources)
+        if top_vid and not already_present:
+            info = _cache.get(VERSIONS, top_vid, {})
+            civitai_resources.append({
+                "type": "checkpoint",
+                "modelVersionId": top_vid,
+                "modelId": info.get("modelId"),
+                "name": info.get("name"),
+                "versionName": info.get("versionName"),
+                "creatorUsername": _cache.get(MODELS, info.get("modelId")),
+                "weight": 1,
+            })
+            meta["civitaiResources"] = civitai_resources
+            entry["meta"] = meta
 
     return results

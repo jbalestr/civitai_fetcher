@@ -129,6 +129,41 @@ def aggregate_by_post(entries, method="max"):
     raise ValueError(f"Unknown aggregation method: {method!r} (expected 'max' or 'sum')")
 
 
+def is_checkpoint_spam(civitai_resources, media_type=None, threshold=5):
+    """
+    Some uploaders pad meta.civitaiResources with every checkpoint their
+    prompt is "compatible" with (seen: 8-20 checkpoint entries on a single
+    image, all weight=1) rather than the one actually used -- gaming
+    discoverability, since each listed checkpoint gets the image surfaced
+    under its page. Confirmed against the Civitai web UI: it's not a
+    fetcher-side bug, the API itself returns this.
+
+    Two legitimate cases genuinely DO use several checkpoints on one entry
+    and must not be caught here:
+      - video (ComfyUI img2vid etc.): separate checkpoints per pipeline
+        stage (e.g. one for the txt2img frame, one each for a WAN
+        high-noise/low-noise pass) -- confirmed real via a manual civitai.red
+        check, 3 checkpoints doing 3 different jobs, not padding.
+      - Anima/Krea-style node-graph tools: per db/migrations/001_initial.sql,
+        these can produce complex multi-stage workflow payloads much like
+        ComfyUI, and there isn't yet a reliable field to identify them
+        specifically -- excluded from this check indirectly via a threshold
+        wide enough to clear genuine multi-stage pipelines instead.
+
+    So: media_type == "video" (or "audio") is exempted outright, and for
+    everything else the bar is raised from ">1" to ">threshold" (default 5)
+    -- every confirmed spam post so far had 5-20 checkpoints, comfortably
+    above what any real multi-stage pipeline needs (2-5), so this should
+    clear legitimate video/Anima/Krea cases while still catching spam.
+    Revisit with a lower/more targeted rule if a real example turns up
+    that needs more than `threshold` checkpoints.
+    """
+    if media_type in ("video", "audio"):
+        return False
+    checkpoints = [r for r in civitai_resources if r.get("type") == "checkpoint"]
+    return len(checkpoints) > threshold
+
+
 def count_resource_usage(entries):
     """
     Tally civitaiResources usage across a set of fetched images — two
